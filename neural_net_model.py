@@ -3,6 +3,7 @@ import os
 import multiprocessing
 import random
 import shutil
+from contextlib import nullcontext
 from typing import Tuple, Callable
 import time
 from datetime import datetime as dt
@@ -332,11 +333,11 @@ class NeuralNetworkModel(nn.Module):
             log.info(f"Training model using device {device}")
 
         # Configure AMP autocast and gradient scaler for CUDA
-        use_amp = device.type == 'cuda'
-        amp_dtype = None
+        amp_ctx = nullcontext()
         scaler = None
-        if use_amp:
+        if device.type == 'cuda':
             amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            amp_ctx = torch.amp.autocast('cuda', dtype=amp_dtype)
             scaler = torch.amp.GradScaler('cuda', enabled=(amp_dtype == torch.float16))
             if ddp.master_proc():
                 log.info(f"AMP enabled with dtype {amp_dtype}")
@@ -394,7 +395,7 @@ class NeuralNetworkModel(nn.Module):
                     input_tensor, target = (torch.tensor(arr, dtype=torch.long).view(batch_size, block_size).to(device)
                                             for arr in loader.next_batch())
                     # calculate step cost with optional AMP autocast
-                    with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                    with amp_ctx:
                         step_activations, step_cost = model(input_tensor, target, skip_softmax=True)
                         # take average of step cost
                         avg_step_cost = step_cost / num_steps

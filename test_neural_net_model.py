@@ -581,19 +581,18 @@ class TestNeuralNetModel(unittest.TestCase):
             scaler_enabled = (amp_dtype == torch.float16)
             self.assertTrue(scaler_enabled)
 
-    def test_amp_not_used_on_cpu_device(self):
-        """AMP is not activated when device type is cpu."""
+    def test_amp_nullcontext_on_cpu_device(self):
+        """AMP uses nullcontext on CPU, autocast is not invoked."""
         layers = [{"embedding": {"num_embeddings": 8, "embedding_dim": 2}},
                   {"tanh": {}},
                   {"linear": {"in_features": 2, "out_features": 8}},
                   {"softmaxlast": {"dim": -1}}]
         model = NeuralNetworkModel("test-amp-off", Mapper(layers, {"sgd": {"lr": .01}}))
         device = next(model.parameters()).device
-        use_amp = device.type == 'cuda'
-        self.assertFalse(use_amp)
+        self.assertNotEqual(device.type, 'cuda')
 
-    def test_amp_autocast_cpu_uses_enabled_false(self):
-        """On CPU, autocast context is called with enabled=False."""
+    def test_amp_autocast_not_called_on_cpu(self):
+        """On CPU, nullcontext is used and autocast is never called."""
         layers = [{"embedding": {"num_embeddings": 8, "embedding_dim": 2}},
                   {"tanh": {}},
                   {"linear": {"in_features": 2, "out_features": 8}},
@@ -604,18 +603,15 @@ class TestNeuralNetModel(unittest.TestCase):
 
         with patch("neural_net_model.Loader") as MockLoader, \
              patch.object(NeuralNetworkModel, 'serialize'), \
-             patch('neural_net_model.torch.amp.autocast', wraps=torch.amp.autocast) as mock_autocast:
+             patch('neural_net_model.torch.amp.autocast') as mock_autocast:
             mock_loader = MagicMock()
             MockLoader.return_value = mock_loader
             mock_loader.next_batch.return_value = tuple(
                 np.array(l, dtype=np.int32) for l in [input_data, target])
             model.train_model("mock_ds", 1, 1, 1, 2, 1)
 
-            # autocast should have been called with enabled=False on CPU
-            mock_autocast.assert_called()
-            for c in mock_autocast.call_args_list:
-                args, kwargs = c
-                self.assertFalse(kwargs.get('enabled', True))
+            # autocast should NOT be called on CPU (nullcontext is used instead)
+            mock_autocast.assert_not_called()
 
     @parameterized.expand([
         (True, torch.bfloat16),
@@ -686,10 +682,10 @@ class TestNeuralNetModel(unittest.TestCase):
             with patch('neural_net_model.next', side_effect=patched_next):
                 model.train_model("mock_ds", 1, 1, 1, 2, 1)
 
+            # Verify autocast was created with CUDA and correct dtype
+            MockAutocast.assert_called_once_with('cuda', dtype=expected_dtype)
             # Verify GradScaler created with correct enabled flag
             MockScaler.assert_called_once_with('cuda', enabled=scaler_enabled)
-            # Verify autocast was called with CUDA and correct dtype
-            MockAutocast.assert_called_with('cuda', dtype=expected_dtype, enabled=True)
             # Verify scaler.scale was called for backward pass
             mock_scaler.scale.assert_called()
             mock_scaled_loss.backward.assert_called()
