@@ -694,5 +694,58 @@ class TestNeuralNetModel(unittest.TestCase):
             mock_scaler.update.assert_called_once()
 
 
+    def test_record_progress_unscales_activation_grads(self):
+        """GradScaler's scale is removed from activation gradients before stats."""
+        layers = [{"linear": {"in_features": 4, "out_features": 4}}, {"tanh": {}}]
+        model = NeuralNetworkModel("test-unscale", Mapper(layers, {"sgd": {"lr": .01}}))
+
+        # Simulate activations with scaled gradients
+        a = torch.randn(2, 4, requires_grad=True)
+        loss = a.sum()
+        loss.backward()
+        # Record the true unscaled gradient values
+        true_grad = a.grad.clone()
+        # Simulate GradScaler inflation by factor of 256
+        scale_factor = 256.0
+        a.grad.mul_(scale_factor)
+
+        # Set up a mock scaler that reports the scale factor
+        mock_scaler = MagicMock()
+        mock_scaler.get_scale.return_value = scale_factor
+
+        # Populate progress so _record_training_overall_progress can compute avg
+        model.progress = [{"cost": 1.0}]
+
+        # Mock _weights to avoid accessing unpopulated weight gradients
+        with patch.object(type(model), '_weights', new_callable=lambda: property(lambda self: [None, None])):
+            model._record_training_overall_progress([a], mock_scaler)
+
+        # Activation grads should have been unscaled back to true values
+        torch.testing.assert_close(a.grad, true_grad)
+        # Stats should reflect unscaled gradient values
+        self.assertIsNotNone(model.stats)
+        grad_stats = model.stats["layers"][0]["gradient"]
+        self.assertAlmostEqual(grad_stats["mean"], true_grad.mean().item(), places=4)
+        self.assertAlmostEqual(grad_stats["std"], true_grad.std().item(), places=4)
+
+    def test_record_progress_no_scaler(self):
+        """Without scaler, activation gradients are used as-is."""
+        layers = [{"linear": {"in_features": 4, "out_features": 4}}, {"tanh": {}}]
+        model = NeuralNetworkModel("test-noscale", Mapper(layers, {"sgd": {"lr": .01}}))
+
+        a = torch.randn(2, 4, requires_grad=True)
+        loss = a.sum()
+        loss.backward()
+        original_grad = a.grad.clone()
+
+        model.progress = [{"cost": 1.0}]
+
+        with patch.object(type(model), '_weights', new_callable=lambda: property(lambda self: [None, None])):
+            model._record_training_overall_progress([a], None)
+
+        # Gradients should remain unchanged
+        torch.testing.assert_close(a.grad, original_grad)
+
+
 if __name__ == '__main__':
     unittest.main()
