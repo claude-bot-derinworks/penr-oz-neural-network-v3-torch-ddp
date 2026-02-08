@@ -1,5 +1,6 @@
 import logging
 import os
+import platform
 import multiprocessing
 import random
 import shutil
@@ -19,7 +20,34 @@ from mappers import Mapper
 
 
 log = logging.getLogger(__name__)
-SHM_PATH = "/dev/shm"
+
+
+def _detect_shm_path() -> str:
+    """Detect the best shared memory path for the current OS.
+
+    Resolution order:
+      1. ``SHM_PATH`` environment variable (if set, exists and writable).
+      2. ``/dev/shm`` on Linux.
+      3. ``/Volumes/RAMDisk`` on macOS (if a RAM disk is mounted there).
+      4. ``/tmp`` as a safe fallback.
+    """
+    env_path = os.environ.get("SHM_PATH")
+    if env_path and os.path.isdir(env_path) and os.access(env_path, os.W_OK):
+        return env_path
+
+    system = platform.system()
+    if system == "Linux":
+        if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+            return "/dev/shm"
+    elif system == "Darwin":
+        if os.path.isdir("/Volumes/RAMDisk") and os.access("/Volumes/RAMDisk", os.W_OK):
+            return "/Volumes/RAMDisk"
+
+    return "/tmp"
+
+
+SHM_PATH = _detect_shm_path()
+os.environ.setdefault("SHM_PATH", SHM_PATH)
 MODELS_FOLDER = "models"
 
 

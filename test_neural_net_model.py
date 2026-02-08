@@ -8,7 +8,7 @@ from parameterized import parameterized
 import numpy as np
 import torch
 import torch.nn as nn
-from neural_net_model import NeuralNetworkModel, SHM_PATH
+from neural_net_model import NeuralNetworkModel, SHM_PATH, _detect_shm_path
 from mappers import Mapper
 import neural_net_layers as nnl
 
@@ -762,6 +762,48 @@ class TestNeuralNetModel(unittest.TestCase):
             actual_calls = mock_scaler.method_calls
             step_calls = [c for c in actual_calls if c[0] in ('step', 'get_scale', 'update')]
             self.assertEqual([c[0] for c in step_calls], ['step', 'get_scale', 'update'])
+
+
+class TestDetectShmPath(unittest.TestCase):
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("neural_net_model.platform.system", return_value="Linux")
+    @patch("neural_net_model.os.path.isdir", side_effect=lambda p: p == "/dev/shm")
+    @patch("neural_net_model.os.access", return_value=True)
+    def test_linux_uses_dev_shm(self, mock_access, mock_isdir, mock_system):
+        self.assertEqual(_detect_shm_path(), "/dev/shm")
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("neural_net_model.platform.system", return_value="Darwin")
+    @patch("neural_net_model.os.path.isdir", side_effect=lambda p: p == "/Volumes/RAMDisk")
+    @patch("neural_net_model.os.access", return_value=True)
+    def test_macos_prefers_ramdisk(self, mock_access, mock_isdir, mock_system):
+        self.assertEqual(_detect_shm_path(), "/Volumes/RAMDisk")
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("neural_net_model.platform.system", return_value="Darwin")
+    @patch("neural_net_model.os.path.isdir", return_value=False)
+    def test_macos_falls_back_to_tmp(self, mock_isdir, mock_system):
+        self.assertEqual(_detect_shm_path(), "/tmp")
+
+    @patch.dict(os.environ, {"SHM_PATH": "/custom/shm"})
+    @patch("neural_net_model.os.path.isdir", side_effect=lambda p: p == "/custom/shm")
+    @patch("neural_net_model.os.access", return_value=True)
+    def test_env_var_override(self, mock_access, mock_isdir):
+        self.assertEqual(_detect_shm_path(), "/custom/shm")
+
+    @patch.dict(os.environ, {"SHM_PATH": "/nonexistent"})
+    @patch("neural_net_model.platform.system", return_value="Linux")
+    @patch("neural_net_model.os.path.isdir", side_effect=lambda p: p in ("/dev/shm",))
+    @patch("neural_net_model.os.access", return_value=True)
+    def test_invalid_env_var_ignored(self, mock_access, mock_isdir, mock_system):
+        self.assertEqual(_detect_shm_path(), "/dev/shm")
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("neural_net_model.platform.system", return_value="Windows")
+    @patch("neural_net_model.os.path.isdir", return_value=False)
+    def test_other_os_falls_back_to_tmp(self, mock_isdir, mock_system):
+        self.assertEqual(_detect_shm_path(), "/tmp")
 
 
 if __name__ == '__main__':
