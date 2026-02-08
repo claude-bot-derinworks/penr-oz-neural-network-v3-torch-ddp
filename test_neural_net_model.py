@@ -1,6 +1,7 @@
 import math
 import os
 import os.path
+import tempfile
 import time
 import unittest
 from unittest.mock import patch, MagicMock, call
@@ -778,12 +779,12 @@ class TestNeuralNetModel(unittest.TestCase):
     @patch("neural_net_model.platform.system", return_value="Darwin")
     @patch("neural_net_model.os.path.isdir", return_value=False)
     def test_detect_shm_path_macos_fallback(self, mock_isdir, mock_system):
-        self.assertEqual(NeuralNetworkModel._detect_shm_path(), "/tmp")
+        self.assertEqual(NeuralNetworkModel._detect_shm_path(), tempfile.gettempdir())
 
     @patch("neural_net_model.platform.system", return_value="Windows")
     @patch("neural_net_model.os.path.isdir", return_value=False)
     def test_detect_shm_path_other_os(self, mock_isdir, mock_system):
-        self.assertEqual(NeuralNetworkModel._detect_shm_path(), "/tmp")
+        self.assertEqual(NeuralNetworkModel._detect_shm_path(), tempfile.gettempdir())
 
 
 if __name__ == '__main__':

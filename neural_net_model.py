@@ -4,6 +4,7 @@ import platform
 import multiprocessing
 import random
 import shutil
+import tempfile
 from contextlib import nullcontext
 from typing import Tuple, Callable
 import time
@@ -32,7 +33,7 @@ class NeuralNetworkModel(nn.Module):
         Resolution order:
           1. ``/dev/shm`` on Linux.
           2. ``/Volumes/RAMDisk`` on macOS (if a RAM disk is mounted there).
-          3. ``/tmp`` as a safe fallback.
+          3. System temp directory as a safe fallback.
         """
         system = platform.system()
         if system == "Linux":
@@ -41,7 +42,7 @@ class NeuralNetworkModel(nn.Module):
         elif system == "Darwin":
             if os.path.isdir("/Volumes/RAMDisk") and os.access("/Volumes/RAMDisk", os.W_OK):
                 return "/Volumes/RAMDisk"
-        return "/tmp"
+        return tempfile.gettempdir()
 
     SHM_PATH = _detect_shm_path()
 
