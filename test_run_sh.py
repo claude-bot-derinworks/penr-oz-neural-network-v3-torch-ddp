@@ -35,10 +35,10 @@ class TestRunSh(unittest.TestCase):
             content = f.read()
         self.assertIn("pip install -r requirements.txt", content)
 
-    def test_script_uses_pytorch_cpu_index(self):
+    def test_script_does_not_force_cpu_wheels(self):
         with open(SCRIPT_PATH) as f:
             content = f.read()
-        self.assertIn("download.pytorch.org/whl/cpu", content)
+        self.assertNotIn("download.pytorch.org/whl/cpu", content)
 
     def test_script_runs_main(self):
         with open(SCRIPT_PATH) as f:
