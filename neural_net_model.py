@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import platform
@@ -16,14 +17,14 @@ import torch.nn as nn
 from torch.optim import Optimizer
 import ddp
 from kv_cache import KVCache, create_kv_cache
-from neural_net_layers import CausalSelfAttention, PositionEmbedding, SoftmaxOnLast, TransformerBlock
+from neural_net_layers import CausalSelfAttention, PerLayerEmbedding, PositionEmbedding, SoftmaxOnLast, TransformerBlock
 from loaders import Loader
-from mappers import Mapper
-from transformers import AutoConfig, AutoModelForCausalLM
-
-
+from mappers import Mapper, load_safetensors
+from transformers import AutoConfig
+from huggingface_hub import snapshot_download
 log = logging.getLogger(__name__)
 MODELS_FOLDER = "models"
+
 
 class NeuralNetworkModel(nn.Module):
 
@@ -57,6 +58,7 @@ class NeuralNetworkModel(nn.Module):
         self.mapper = mapper
         self.layers = nn.ModuleList(self.mapper.to_layers())
         self._is_softmax_last = isinstance(self.layers[-1], nn.Softmax)
+        self._wire_ple()
         self.optimizer: Optimizer = self.mapper.to_optimizer(self.parameters())
         self.progress = []
         self.avg_cost = None
@@ -195,16 +197,20 @@ class NeuralNetworkModel(nn.Module):
         """
         log.info(f"Fetching HuggingFace config for {hf_repo_id} (revision={revision})")
         hf_config = AutoConfig.from_pretrained(hf_repo_id, revision=revision)
+        os.makedirs(MODELS_FOLDER, exist_ok=True)
+        hf_config_path = os.path.join(MODELS_FOLDER, f"model_{model_id}_hf_config.json")
+        with open(hf_config_path, "w") as f:
+            json.dump(hf_config.to_dict(), f, indent=2)
+        log.info(f"HuggingFace config for {hf_repo_id} written to {hf_config_path}")
 
-        log.info(f"Downloading HuggingFace model weights for {hf_repo_id}")
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            hf_repo_id,
-            revision=revision,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
+        log.info(f"Downloading HF model weights for {hf_repo_id}")
+        weights_dir = os.path.join(MODELS_FOLDER, f"model_{model_id}_hf")
+        model_dir = snapshot_download(
+            hf_repo_id, revision=revision,
+            local_dir=weights_dir,
+            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
         )
-        hf_sd = hf_model.state_dict()
-        del hf_model
+        hf_sd = load_safetensors(model_dir)
 
         # Detect actual layer count from state dict for robustness
         n_layer = Mapper.detect_hf_n_layer(hf_sd)
@@ -214,6 +220,10 @@ class NeuralNetworkModel(nn.Module):
         log.info(f"Detected {n_layer} transformer layers from HuggingFace state dict")
 
         layers_config = Mapper.from_hf_config(hf_config, n_layer_override=n_layer)
+        layers_path = os.path.join(MODELS_FOLDER, f"model_{model_id}_layers.json")
+        with open(layers_path, "w") as f:
+            json.dump(layers_config, f, indent=2)
+        log.info(f"Mapped layers config written to {layers_path}")
         optim_config = {"adamw": {"lr": 6e-4, "betas": [0.9, 0.95], "eps": 1e-8}}
         mapper = Mapper(layers_config, optim_config)
 
@@ -222,7 +232,10 @@ class NeuralNetworkModel(nn.Module):
         model.to(dtype=torch.bfloat16)
         model.to(device)
 
-        mapped_sd = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_config)
+        mapped_sd = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_config,
+                                                        dtype=torch.bfloat16)
+        if hasattr(hf_sd, "close"):
+            hf_sd.close()
         del hf_sd
         model.load_state_dict(mapped_sd, strict=True)
         del mapped_sd
@@ -247,7 +260,20 @@ class NeuralNetworkModel(nn.Module):
         except FileNotFoundError as e:
             log.warning(f"Failed to delete: {str(e)}")
 
+    def _wire_ple(self):
+        """Connect PerLayerEmbedding modules to their TransformerBlocks."""
+        ple_modules = [m for m in self.modules() if isinstance(m, PerLayerEmbedding)]
+        if not ple_modules:
+            self._ple_modules = []
+            return
+        blocks = [l for l in self.layers if isinstance(l, TransformerBlock)]
+        for ple in ple_modules:
+            ple._transformer_blocks = blocks
+        self._ple_modules = ple_modules
+
     def forward(self, input_tensor: Tensor, target: Tensor=None, skip_softmax=False) -> Tuple[list[Tensor], Tensor]:
+        for ple in self._ple_modules:
+            ple._input_ids = input_tensor
         forwarded_tensors = []
         forwarded_tensor = input_tensor
         previous_tensor = input_tensor

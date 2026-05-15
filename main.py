@@ -203,7 +203,7 @@ class OutputRequest(ModelRequest):
         description="The expected target data (Optional)"
     )
 
-class GenerateRequest(ModelRequest):
+class GenerateRequest(ModelOnDeviceRequest):
     input: list = Field(
         ...,
         examples=[
@@ -420,8 +420,10 @@ def evaluate_model(body: EvaluateRequest = Body(...)):
 @app.post("/generate/")
 def model_generate(body: GenerateRequest = Body(...)):
     model_id = body.model_id
-    log.info(f"Generating tokens using model {model_id}")
+    device = body.device
+    log.info(f"Generating tokens using model {model_id} on device {device}")
     model = NeuralNetworkModel.deserialize(model_id)
+    model.to(device=device)
     if body.stream:
         log.info(f"Streaming token generation for model {model_id}")
         def token_stream():
