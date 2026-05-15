@@ -296,13 +296,13 @@ class TestMapper(unittest.TestCase):
         self.assertIn("post_attn_norm", tb)
         self.assertFalse(tb["post_norm_on_residual"])
 
-    def test_from_hf_config_gemma3_post_norm_on_residual(self):
-        """Gemma 3+ sets post_norm_on_residual=True (norm after residual add)."""
+    def test_from_hf_config_gemma3_post_norm_on_branch(self):
+        """All Gemma variants with post-norms use branch pattern (norm before residual add)."""
         for model_type in ("gemma3", "gemma3_text", "gemma4", "gemma4_text"):
             cfg = self._make_gemma_config(model_type=model_type, n_layer=1)
             layers = Mapper.from_hf_config(cfg)
             tb = layers[1]["transformerblock"]
-            self.assertTrue(tb["post_norm_on_residual"], f"Expected True for {model_type}")
+            self.assertFalse(tb["post_norm_on_residual"], f"Expected False for {model_type}")
 
     def test_from_hf_config_gemma1_no_post_norms(self):
         """Gemma 1 does not have post-norms."""
@@ -383,6 +383,199 @@ class TestMapper(unittest.TestCase):
         layers = Mapper.from_hf_config(cfg)
         attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
         self.assertAlmostEqual(attn_cfg["rope_theta"], 50000.0)
+
+    def test_from_hf_config_gemma_per_layer_rope_theta(self):
+        """Heterogeneous models: sliding layers use local theta, full use global theta."""
+        n_layer = 4
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer,
+                                       multimodal=True)
+        # Simulate Gemma 3n-style config: rope_theta = global, rope_local_base_freq = local
+        cfg.text_config.rope_theta = 1000000.0
+        cfg.text_config.rope_local_base_freq = 10000.0
+        cfg.text_config.layer_types = ["sliding_attention", "full_attention",
+                                        "sliding_attention", "full_attention"]
+        layers = Mapper.from_hf_config(cfg)
+        for i, expected in enumerate((10000.0, 1000000.0, 10000.0, 1000000.0)):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertAlmostEqual(attn_cfg["rope_theta"], expected,
+                                   msg=f"Layer {i} rope_theta mismatch")
+
+    def test_from_hf_config_gemma2_and_gemma4_have_qk_norm(self):
+        """Gemma 2 and Gemma 4 attention configs include q_norm and k_norm
+        for non-shared layers."""
+        for model_type in ("gemma2", "gemma4", "gemma4_text"):
+            cfg = self._make_gemma_config(model_type=model_type, n_layer=1, head_dim=16)
+            layers = Mapper.from_hf_config(cfg)
+            attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertIn("q_norm", attn_cfg, f"Missing q_norm for {model_type}")
+            self.assertIn("k_norm", attn_cfg, f"Missing k_norm for {model_type}")
+            self.assertEqual(attn_cfg["q_norm"]["rmsnorm"]["normalized_shape"], 16)
+
+    def test_from_hf_config_gemma_and_gemma3_no_qk_norm(self):
+        """Gemma 1 and Gemma 3 do not have q_norm/k_norm."""
+        for model_type in ("gemma", "gemma3", "gemma3_text"):
+            cfg = self._make_gemma_config(model_type=model_type, n_layer=1)
+            layers = Mapper.from_hf_config(cfg)
+            attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertNotIn("q_norm", attn_cfg, f"Unexpected q_norm for {model_type}")
+            self.assertNotIn("k_norm", attn_cfg, f"Unexpected k_norm for {model_type}")
+
+    def test_from_hf_config_gemma4_shared_layer_only_q_norm(self):
+        """Gemma 4 shared layers have q_norm but not k_norm
+        (k is reused from reference layer's cache, already normed)."""
+        n_layer = 4
+        num_kv_shared = 2
+        layer_types = ["sliding_attention", "full_attention"] * 2
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer, multimodal=True)
+        cfg.text_config.layer_types = layer_types
+        cfg.text_config.num_kv_shared_layers = num_kv_shared
+        layers = Mapper.from_hf_config(cfg)
+        # Non-shared layers (0, 1) have both q_norm and k_norm
+        for i in (0, 1):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertIn("q_norm", attn_cfg, f"Layer {i} missing q_norm")
+            self.assertIn("k_norm", attn_cfg, f"Layer {i} missing k_norm")
+        # Shared layers (2, 3) have q_norm but NOT k_norm
+        for i in (2, 3):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertIn("q_norm", attn_cfg, f"Shared layer {i} missing q_norm")
+            self.assertNotIn("k_norm", attn_cfg, f"Shared layer {i} should not have k_norm")
+
+    def test_from_hf_config_gpt2_no_qk_norm(self):
+        """GPT-2 attention config does not include q_norm/k_norm."""
+        cfg = self._make_gpt2_config(n_layer=1)
+        layers = Mapper.from_hf_config(cfg)
+        attn_cfg = layers[2]["residual"][0]["sequential"][2]["attention"]
+        self.assertNotIn("q_norm", attn_cfg)
+        self.assertNotIn("k_norm", attn_cfg)
+
+    def test_from_hf_config_gemma4_kv_shared_layer_idx(self):
+        """KV-shared layers in config carry kv_shared_layer_idx pointing to reference layer."""
+        n_layer = 10
+        num_kv_shared = 4
+        layer_types = (["sliding_attention"] * 3 + ["full_attention"] + ["sliding_attention"]) * 2
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer, multimodal=True)
+        cfg.text_config.layer_types = layer_types
+        cfg.text_config.num_kv_shared_layers = num_kv_shared
+
+        layers = Mapper.from_hf_config(cfg)
+
+        # Non-shared layers (0-5) should NOT have kv_shared_layer_idx
+        for i in range(6):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertNotIn("kv_shared_layer_idx", attn_cfg, f"Layer {i} should not be shared")
+
+        # Layer 6 is shared sliding → references layer 5 (last non-shared sliding)
+        attn_cfg = layers[7]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertEqual(attn_cfg["kv_shared_layer_idx"], 5)
+
+        # Layer 8 is shared full → references layer 3 (last non-shared full before first_kv_shared)
+        attn_cfg = layers[9]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertEqual(attn_cfg["kv_shared_layer_idx"], 3)
+
+    def test_from_hf_config_no_kv_sharing_without_shared_layers(self):
+        """Models without KV-shared layers don't get kv_shared_layer_idx."""
+        cfg = self._make_gemma_config(model_type="gemma3", n_layer=4)
+        layers = Mapper.from_hf_config(cfg)
+        for i in range(4):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertNotIn("kv_shared_layer_idx", attn_cfg)
+
+    def test_from_hf_config_gemma_final_logit_softcapping(self):
+        """final_logit_softcapping flows into softmaxlast config."""
+        cfg = self._make_gemma_config(model_type="gemma2", n_layer=1)
+        cfg.final_logit_softcapping = 30.0
+        layers = Mapper.from_hf_config(cfg)
+        softmax_cfg = layers[-1]["softmaxlast"]
+        self.assertEqual(softmax_cfg["softcap"], 30.0)
+
+    def test_from_hf_config_gemma_no_softcapping_when_absent(self):
+        """Without final_logit_softcapping, softmaxlast has no softcap key."""
+        cfg = self._make_gemma_config(model_type="gemma3", n_layer=1)
+        layers = Mapper.from_hf_config(cfg)
+        softmax_cfg = layers[-1]["softmaxlast"]
+        self.assertNotIn("softcap", softmax_cfg)
+
+    def test_from_hf_config_gemma_sliding_window_on_sliding_layers(self):
+        """sliding_window is set only on sliding_attention layers, not full_attention."""
+        n_layer = 3
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer, multimodal=True)
+        cfg.text_config.layer_types = ["sliding_attention", "full_attention", "sliding_attention"]
+        cfg.text_config.sliding_window = 4096
+        layers = Mapper.from_hf_config(cfg)
+        for i, expected_window in [(0, 4096), (1, None), (2, 4096)]:
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            if expected_window is not None:
+                self.assertEqual(attn_cfg["sliding_window"], expected_window)
+            else:
+                self.assertNotIn("sliding_window", attn_cfg)
+
+    def test_from_hf_config_gemma_no_sliding_window_when_absent(self):
+        """Without sliding_window config, no layers get sliding_window."""
+        cfg = self._make_gemma_config(model_type="gemma3", n_layer=2)
+        layers = Mapper.from_hf_config(cfg)
+        for i in range(2):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertNotIn("sliding_window", attn_cfg)
+
+    def test_from_hf_config_gemma4_attn_scale_unit(self):
+        """Gemma 4 with qk_norm and no query_pre_attn_scalar uses attn_scale=1.0."""
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=1, multimodal=True)
+        layers = Mapper.from_hf_config(cfg)
+        attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertEqual(attn_cfg["attn_scale"], 1.0)
+
+    def test_from_hf_config_gemma3_attn_scale_from_scalar(self):
+        """Gemma 3 with query_pre_attn_scalar uses scalar ** -0.5."""
+        cfg = self._make_gemma_config(model_type="gemma3", n_layer=1)
+        cfg.query_pre_attn_scalar = 256
+        layers = Mapper.from_hf_config(cfg)
+        attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertAlmostEqual(attn_cfg["attn_scale"], 256 ** -0.5, places=6)
+
+    def test_from_hf_config_gemma1_no_attn_scale(self):
+        """Gemma 1 (no qk_norm, no query_pre_attn_scalar) has no attn_scale."""
+        cfg = self._make_gemma_config(model_type="gemma", n_layer=1)
+        layers = Mapper.from_hf_config(cfg)
+        attn_cfg = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertNotIn("attn_scale", attn_cfg)
+
+    def test_from_hf_config_gemma4_partial_rotary_on_full_attn_layers(self):
+        """Full attention layers with partial_rotary_factor get rotary_dim set."""
+        n_layer = 3
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer,
+                                       multimodal=True, head_dim=256)
+        cfg.text_config.global_head_dim = 512
+        cfg.text_config.layer_types = ["sliding_attention", "full_attention", "sliding_attention"]
+        cfg.text_config.rope_parameters = {
+            "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+            "sliding_attention": {"rope_theta": 10000.0},
+        }
+        del cfg.text_config.rope_theta
+        layers = Mapper.from_hf_config(cfg)
+        # Full attention layer (idx 1): head_dim=512, partial_rotary=0.25 -> rotary_dim=128
+        full_attn = layers[2]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertEqual(full_attn["rotary_dim"], 128)
+        # Sliding layers: no partial_rotary_factor -> no rotary_dim key
+        slide_attn = layers[1]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+        self.assertNotIn("rotary_dim", slide_attn)
+
+    def test_from_hf_config_gemma_per_layer_rope_theta_from_rope_scaling(self):
+        """Heterogeneous models: layer-specific rope_theta sourced from rope_scaling dict."""
+        n_layer = 3
+        cfg = self._make_gemma_config(model_type="gemma4", n_layer=n_layer,
+                                       multimodal=True)
+        del cfg.text_config.rope_theta
+        cfg.text_config.rope_scaling = {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 50000.0},
+            "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0},
+        }
+        cfg.text_config.layer_types = ["full_attention", "sliding_attention", "full_attention"]
+        layers = Mapper.from_hf_config(cfg)
+        for i, expected in enumerate((1000000.0, 50000.0, 1000000.0)):
+            attn_cfg = layers[1 + i]["transformerblock"]["attn_block"]["sequential"][2]["attention"]
+            self.assertAlmostEqual(attn_cfg["rope_theta"], expected,
+                                   msg=f"Layer {i} rope_theta mismatch")
 
 
     def _make_hf_sd(self, n_layer=2, n_embd=32, n_head=2, vocab_size=64, block_size=16):
@@ -479,6 +672,13 @@ class TestMapper(unittest.TestCase):
                 sd[f"{p}.self_attn.k_proj.weight"] = torch.zeros(lkv * lhd, n_embd)
                 sd[f"{p}.self_attn.v_proj.weight"] = torch.zeros(lkv * lhd, n_embd)
             sd[f"{p}.self_attn.o_proj.weight"] = torch.zeros(n_embd, n_head * lhd)
+            if model_type == "gemma2":
+                sd[f"{p}.self_attn.q_norm.weight"] = torch.zeros(lhd)
+                sd[f"{p}.self_attn.k_norm.weight"] = torch.zeros(lhd)
+            elif model_type in ("gemma4", "gemma4_text"):
+                sd[f"{p}.self_attn.q_norm.weight"] = torch.zeros(lhd)
+                if not is_shared:
+                    sd[f"{p}.self_attn.k_norm.weight"] = torch.zeros(lhd)
             if has_post_norms:
                 sd[f"{p}.post_attention_layernorm.weight"] = torch.zeros(n_embd)
                 sd[f"{p}.pre_feedforward_layernorm.weight"] = torch.zeros(n_embd)
@@ -488,6 +688,8 @@ class TestMapper(unittest.TestCase):
             sd[f"{p}.mlp.gate_proj.weight"] = torch.zeros(l_inter, n_embd)
             sd[f"{p}.mlp.up_proj.weight"] = torch.zeros(l_inter, n_embd)
             sd[f"{p}.mlp.down_proj.weight"] = torch.zeros(n_embd, l_inter)
+            if model_type in ("gemma4", "gemma4_text"):
+                sd[f"{p}.layer_scalar"] = torch.ones(1)
         sd[f"{pfx}.norm.weight"] = torch.zeros(n_embd)
         return sd
 
@@ -656,6 +858,32 @@ class TestMapper(unittest.TestCase):
                                    {"adamw": {"lr": 1e-4, "betas": [0.9, 0.95], "eps": 1e-8}}))
         mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
         self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()))
+
+    def test_gemma_qk_norm_weights_mapped_with_offset(self):
+        """Gemma 2 / Gemma 4 q_norm/k_norm weights get +1 applied during mapping."""
+        for model_type in ("gemma2", "gemma4"):
+            hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=1)
+            hf_cfg = self._make_gemma_hf_config(model_type=model_type, n_layer=1, head_dim=8)
+            hf_sd["model.layers.0.self_attn.q_norm.weight"] = torch.ones(8) * 0.5
+            hf_sd["model.layers.0.self_attn.k_norm.weight"] = torch.ones(8) * 0.3
+            mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, 1, hf_cfg)
+            self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.q_norm.weight"],
+                                           torch.ones(8) * 1.5),
+                            f"q_norm offset wrong for {model_type}")
+            self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.k_norm.weight"],
+                                           torch.ones(8) * 1.3),
+                            f"k_norm offset wrong for {model_type}")
+
+    def test_gemma3_no_qk_norm_in_mapping(self):
+        """Gemma 1 and Gemma 3 mapping do not produce q_norm/k_norm keys."""
+        for model_type in ("gemma", "gemma3"):
+            hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=1)
+            hf_cfg = self._make_gemma_hf_config(model_type=model_type, n_layer=1)
+            mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, 1, hf_cfg)
+            self.assertNotIn("layers.1.attn_block.2.q_norm.weight", mapped,
+                             f"Unexpected q_norm for {model_type}")
+            self.assertNotIn("layers.1.attn_block.2.k_norm.weight", mapped,
+                             f"Unexpected k_norm for {model_type}")
 
     def test_gemma4_kv_shared_layers_copy_from_reference(self):
         """KV-shared layers use reference layer k/v when own k_proj/v_proj are absent."""
