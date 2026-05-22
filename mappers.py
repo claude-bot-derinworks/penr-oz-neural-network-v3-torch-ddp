@@ -287,6 +287,8 @@ class Mapper:
         # layers, k_norm non-shared only).  Gemma 3 uses query_pre_attn_scalar
         # instead and has no q_norm/k_norm.
         has_qk_norm = model_type in ("gemma2", "gemma4", "gemma4_text")
+        # v_norm: Gemma 4 applies RMSNorm (without learnable scale) to value states
+        has_v_norm = model_type in ("gemma4", "gemma4_text")
         # Attention scale: Gemma 4 with qk_norm uses scale=1.0 (norms handle
         # magnitude); Gemma 2/3 use query_pre_attn_scalar ** -0.5; default
         # (None) lets PyTorch use 1/sqrt(head_dim).
@@ -386,6 +388,8 @@ class Mapper:
                 attn_args["q_norm"] = {"rmsnorm": {"normalized_shape": layer_head_dim, "eps": rms_norm_eps}}
                 if i not in kv_ref_layer:
                     attn_args["k_norm"] = {"rmsnorm": {"normalized_shape": layer_head_dim, "eps": rms_norm_eps}}
+            if has_v_norm and i not in kv_ref_layer:
+                attn_args["v_norm"] = {"rmsnorm": {"normalized_shape": layer_head_dim, "eps": rms_norm_eps, "with_scale": False}}
             if i in kv_ref_layer:
                 attn_args["kv_shared_layer_idx"] = kv_ref_layer[i]
 
@@ -543,6 +547,11 @@ class Mapper:
         model_type = hf_config.model_type
         has_post_norms = model_type != "gemma"
 
+        # Gemma 1/2/3 use centered RMSNorm (weight init 0, applied as 1+w);
+        # Gemma 4 uses direct RMSNorm (weight init 1, applied as w).
+        # Our RMSNorm uses direct convention, so add +1 only for centered models.
+        norm_offset = 0 if model_type in ("gemma4", "gemma4_text") else 1
+
         # Multimodal models (gemma3, gemma4) prefix text keys with "model.language_model."
         pfx = "model.language_model" if "model.language_model.embed_tokens.weight" in hf_sd else "model"
 
@@ -585,14 +594,13 @@ class Mapper:
         if has_ple:
             mapped["layers.1.embed_per_layer.weight"] = hf_sd[f"{pfx}.embed_tokens_per_layer.weight"]
             mapped["layers.1.projection.weight"] = hf_sd[f"{pfx}.per_layer_model_projection.weight"]
-            mapped["layers.1.norm.weight"] = hf_sd[f"{pfx}.per_layer_projection_norm.weight"] + 1
+            mapped["layers.1.norm.weight"] = hf_sd[f"{pfx}.per_layer_projection_norm.weight"] + norm_offset
 
         for i in range(n_layer):
             block_idx = 1 + ple_offset + i  # 0=embedding, [1=PLE], then transformer blocks
             hf = f"{pfx}.layers.{i}"
 
-            # Attention pre-norm (Gemma uses 1+weight centered RMSNorm; convert to standard)
-            mapped[f"layers.{block_idx}.attn_block.0.weight"] = hf_sd[f"{hf}.input_layernorm.weight"] + 1
+            mapped[f"layers.{block_idx}.attn_block.0.weight"] = hf_sd[f"{hf}.input_layernorm.weight"] + norm_offset
 
             # QKV projection (concatenate separate Q, K, V into single tensor)
             q = hf_sd[f"{hf}.self_attn.q_proj.weight"]
@@ -617,23 +625,23 @@ class Mapper:
             # Q/K norms — skip k_norm for KV-shared layers (they reuse the reference layer's cache)
             q_norm_key = f"{hf}.self_attn.q_norm.weight"
             if q_norm_key in hf_sd:
-                mapped[f"layers.{block_idx}.attn_block.2.q_norm.weight"] = hf_sd[q_norm_key] + 1
+                mapped[f"layers.{block_idx}.attn_block.2.q_norm.weight"] = hf_sd[q_norm_key] + norm_offset
             if ref is None:
                 k_norm_key = f"{hf}.self_attn.k_norm.weight"
                 if k_norm_key in hf_sd:
-                    mapped[f"layers.{block_idx}.attn_block.2.k_norm.weight"] = hf_sd[k_norm_key] + 1
+                    mapped[f"layers.{block_idx}.attn_block.2.k_norm.weight"] = hf_sd[k_norm_key] + norm_offset
 
             if has_post_norms:
                 mapped[f"layers.{block_idx}.post_attn_norm.weight"] = (
-                    hf_sd[f"{hf}.post_attention_layernorm.weight"] + 1)
+                    hf_sd[f"{hf}.post_attention_layernorm.weight"] + norm_offset)
                 mapped[f"layers.{block_idx}.mlp_block.0.weight"] = (
-                    hf_sd[f"{hf}.pre_feedforward_layernorm.weight"] + 1)
+                    hf_sd[f"{hf}.pre_feedforward_layernorm.weight"] + norm_offset)
                 mapped[f"layers.{block_idx}.post_mlp_norm.weight"] = (
-                    hf_sd[f"{hf}.post_feedforward_layernorm.weight"] + 1)
+                    hf_sd[f"{hf}.post_feedforward_layernorm.weight"] + norm_offset)
             else:
                 # Gemma 1: post_attention_layernorm acts as the pre-MLP norm
                 mapped[f"layers.{block_idx}.mlp_block.0.weight"] = (
-                    hf_sd[f"{hf}.post_attention_layernorm.weight"] + 1)
+                    hf_sd[f"{hf}.post_attention_layernorm.weight"] + norm_offset)
 
             # Gated MLP
             mapped[f"layers.{block_idx}.mlp_block.1.gate_proj.weight"] = hf_sd[f"{hf}.mlp.gate_proj.weight"]
@@ -645,7 +653,7 @@ class Mapper:
                 mapped[f"layers.{block_idx}.ple_gate.weight"] = hf_sd[f"{hf}.per_layer_input_gate.weight"]
                 mapped[f"layers.{block_idx}.ple_proj.weight"] = hf_sd[f"{hf}.per_layer_projection.weight"]
                 mapped[f"layers.{block_idx}.ple_norm.weight"] = (
-                    hf_sd[f"{hf}.post_per_layer_input_norm.weight"] + 1)
+                    hf_sd[f"{hf}.post_per_layer_input_norm.weight"] + norm_offset)
 
             # Per-layer output scaling buffer
             layer_scalar_key = f"{hf}.layer_scalar"
@@ -654,7 +662,7 @@ class Mapper:
 
         # Final RMSNorm
         ln_f_idx = 1 + ple_offset + n_layer
-        mapped[f"layers.{ln_f_idx}.weight"] = hf_sd[f"{pfx}.norm.weight"] + 1
+        mapped[f"layers.{ln_f_idx}.weight"] = hf_sd[f"{pfx}.norm.weight"] + norm_offset
 
         # LM head – use explicit lm_head.weight when available, else tied embedding
         lm_head_weight = hf_sd.get("lm_head.weight", hf_sd[f"{pfx}.embed_tokens.weight"])

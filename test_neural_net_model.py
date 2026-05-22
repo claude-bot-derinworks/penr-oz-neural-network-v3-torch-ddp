@@ -1211,12 +1211,14 @@ class TestNeuralNetModel(unittest.TestCase):
             sd[f"{p}.mlp.gate_proj.weight"] = torch.zeros(intermediate_size, n_embd)
             sd[f"{p}.mlp.up_proj.weight"] = torch.zeros(intermediate_size, n_embd)
             sd[f"{p}.mlp.down_proj.weight"] = torch.zeros(n_embd, intermediate_size)
+            if model_type in ("gemma4", "gemma4_text"):
+                sd[f"{p}.layer_scalar"] = torch.ones(1)
         sd[f"{pfx}.norm.weight"] = torch.zeros(n_embd)
         return sd
 
     def test_gemma_mapped_keys_match_model_state_dict(self):
         """Mapped Gemma keys must exactly match a fresh model's state dict."""
-        for model_type in ("gemma", "gemma3"):
+        for model_type in ("gemma", "gemma3", "gemma4"):
             n_layer, n_embd, n_head, n_kv_heads, head_dim = 2, 32, 4, 2, 8
             vocab_size, intermediate_size = 64, 64
             hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=n_layer,
@@ -1237,6 +1239,50 @@ class TestNeuralNetModel(unittest.TestCase):
             mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
             self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()),
                              f"Key mismatch for {model_type}")
+
+    def test_gemma4_norm_weights_not_offset(self):
+        """Gemma 4 uses direct RMSNorm convention — norm weights must NOT be offset by +1."""
+        n_layer, n_embd, n_head, n_kv_heads, head_dim = 1, 32, 4, 2, 8
+        vocab_size, intermediate_size = 64, 64
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma4", n_layer=n_layer,
+                                         n_embd=n_embd, n_head=n_head,
+                                         n_kv_heads=n_kv_heads, head_dim=head_dim,
+                                         vocab_size=vocab_size,
+                                         intermediate_size=intermediate_size)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma4", n_layer=n_layer,
+                                              hidden_size=n_embd,
+                                              num_attention_heads=n_head,
+                                              num_key_value_heads=n_kv_heads,
+                                              head_dim=head_dim,
+                                              vocab_size=vocab_size,
+                                              intermediate_size=intermediate_size)
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
+        for key, value in mapped.items():
+            if "norm" in key or "layernorm" in key:
+                self.assertTrue(torch.equal(value, torch.zeros_like(value)),
+                                f"Gemma 4 norm weight {key} should not be offset by +1")
+
+    def test_gemma3_norm_weights_offset_by_one(self):
+        """Gemma 3 uses centered RMSNorm convention — norm weights must be offset by +1."""
+        n_layer, n_embd, n_head, n_kv_heads, head_dim = 1, 32, 4, 2, 8
+        vocab_size, intermediate_size = 64, 64
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma3", n_layer=n_layer,
+                                         n_embd=n_embd, n_head=n_head,
+                                         n_kv_heads=n_kv_heads, head_dim=head_dim,
+                                         vocab_size=vocab_size,
+                                         intermediate_size=intermediate_size)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma3", n_layer=n_layer,
+                                              hidden_size=n_embd,
+                                              num_attention_heads=n_head,
+                                              num_key_value_heads=n_kv_heads,
+                                              head_dim=head_dim,
+                                              vocab_size=vocab_size,
+                                              intermediate_size=intermediate_size)
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
+        for key, value in mapped.items():
+            if "norm" in key or "layernorm" in key:
+                self.assertTrue(torch.equal(value, torch.ones_like(value)),
+                                f"Gemma 3 norm weight {key} should be offset by +1")
 
     @patch("neural_net_model.NeuralNetworkModel.serialize")
     @patch("neural_net_model.load_safetensors")
@@ -1265,60 +1311,6 @@ class TestNeuralNetModel(unittest.TestCase):
         self.assertEqual(model.status["code"], "Imported")
         self.assertIn("google/gemma-3-1b", model.status["message"])
         mock_serialize.assert_called_once()
-
-
-    # ---- Gemma import tests ----
-
-    def _make_gemma_hf_sd(self, model_type="gemma3", n_layer=1, n_embd=32,
-                           n_head=4, n_kv_heads=2, head_dim=8,
-                           vocab_size=64, intermediate_size=64,
-                           multimodal=False):
-        sd = {}
-        pfx = "model.language_model" if multimodal else "model"
-        sd[f"{pfx}.embed_tokens.weight"] = torch.zeros(vocab_size, n_embd)
-        has_post_norms = model_type != "gemma"
-        for i in range(n_layer):
-            p = f"{pfx}.layers.{i}"
-            sd[f"{p}.input_layernorm.weight"] = torch.zeros(n_embd)
-            sd[f"{p}.self_attn.q_proj.weight"] = torch.zeros(n_head * head_dim, n_embd)
-            sd[f"{p}.self_attn.k_proj.weight"] = torch.zeros(n_kv_heads * head_dim, n_embd)
-            sd[f"{p}.self_attn.v_proj.weight"] = torch.zeros(n_kv_heads * head_dim, n_embd)
-            sd[f"{p}.self_attn.o_proj.weight"] = torch.zeros(n_embd, n_head * head_dim)
-            if has_post_norms:
-                sd[f"{p}.post_attention_layernorm.weight"] = torch.zeros(n_embd)
-                sd[f"{p}.pre_feedforward_layernorm.weight"] = torch.zeros(n_embd)
-                sd[f"{p}.post_feedforward_layernorm.weight"] = torch.zeros(n_embd)
-            else:
-                sd[f"{p}.post_attention_layernorm.weight"] = torch.zeros(n_embd)
-            sd[f"{p}.mlp.gate_proj.weight"] = torch.zeros(intermediate_size, n_embd)
-            sd[f"{p}.mlp.up_proj.weight"] = torch.zeros(intermediate_size, n_embd)
-            sd[f"{p}.mlp.down_proj.weight"] = torch.zeros(n_embd, intermediate_size)
-        sd[f"{pfx}.norm.weight"] = torch.zeros(n_embd)
-        return sd
-
-    def test_gemma_mapped_keys_match_model_state_dict(self):
-        """Mapped Gemma keys must exactly match a fresh model's state dict."""
-        for model_type in ("gemma", "gemma3"):
-            n_layer, n_embd, n_head, n_kv_heads, head_dim = 2, 32, 4, 2, 8
-            vocab_size, intermediate_size = 64, 64
-            hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=n_layer,
-                                             n_embd=n_embd, n_head=n_head,
-                                             n_kv_heads=n_kv_heads, head_dim=head_dim,
-                                             vocab_size=vocab_size,
-                                             intermediate_size=intermediate_size)
-            hf_cfg = self._make_gemma_hf_config(model_type=model_type, n_layer=n_layer,
-                                                  hidden_size=n_embd,
-                                                  num_attention_heads=n_head,
-                                                  num_key_value_heads=n_kv_heads,
-                                                  head_dim=head_dim,
-                                                  vocab_size=vocab_size,
-                                                  intermediate_size=intermediate_size)
-            layers_config = Mapper.from_hf_config(hf_cfg)
-            model = NeuralNetworkModel("tmp",
-                        Mapper(layers_config, {"adamw": {"lr": 1e-4, "betas": [0.9, 0.95], "eps": 1e-8}}))
-            mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
-            self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()),
-                             f"Key mismatch for {model_type}")
 
 
     @patch('neural_net_model.dist.destroy_process_group')
