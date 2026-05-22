@@ -8,7 +8,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, num_heads: int, dropout: float=0.0,
                  num_kv_heads: int=None, rope_theta: float=None,
                  head_dim: int=None, q_norm: nn.Module=None,
-                 k_norm: nn.Module=None, kv_shared_layer_idx: int=None,
+                 k_norm: nn.Module=None, v_norm: nn.Module=None,
+                 kv_shared_layer_idx: int=None,
                  sliding_window: int=None, attn_scale: float=None,
                  rotary_dim: int=None):
         super().__init__()
@@ -18,6 +19,7 @@ class CausalSelfAttention(nn.Module):
         self.rope_theta = rope_theta
         self.q_norm = q_norm
         self.k_norm = k_norm
+        self.v_norm = v_norm
         self.kv_shared_layer_idx = kv_shared_layer_idx
         self.sliding_window = sliding_window
         self.attn_scale = attn_scale
@@ -102,6 +104,8 @@ class CausalSelfAttention(nn.Module):
             v = v_raw.view(batch_size, block_size, self.num_kv_heads, head_dim).transpose(1, 2)
             if self.k_norm is not None:
                 k = self.k_norm(k)
+            if self.v_norm is not None:
+                v = self.v_norm(v)
             if self.rope_theta is not None:
                 offset = self._kv_cache.seq_len(self._layer_idx) if self._kv_cache is not None else 0
                 cos, sin = self._rope_cos_sin(block_size, rope_dim, offset, q.device, q.dtype)
@@ -202,16 +206,21 @@ class SoftmaxOnLast(nn.Softmax):
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
-    def __init__(self, normalized_shape: int, eps: float = 1e-6):
+    def __init__(self, normalized_shape: int, eps: float = 1e-6,
+                 with_scale: bool = True):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.eps = eps
+        self.with_scale = with_scale
+        if with_scale:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = x.dtype
         x_float = x.float()
-        norm = x_float.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x_float * norm).to(dtype) * self.weight
+        normed = x_float * x_float.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        if self.with_scale:
+            return normed.to(dtype) * self.weight
+        return normed.to(dtype)
 
 
 class GatedMLP(nn.Module):
