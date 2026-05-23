@@ -860,19 +860,32 @@ class TestMapper(unittest.TestCase):
         self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()))
 
     def test_gemma_qk_norm_weights_mapped_with_offset(self):
-        """Gemma 2 / Gemma 4 q_norm/k_norm weights get +1 applied during mapping."""
-        for model_type in ("gemma2", "gemma4"):
-            hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=1)
-            hf_cfg = self._make_gemma_hf_config(model_type=model_type, n_layer=1, head_dim=8)
-            hf_sd["model.layers.0.self_attn.q_norm.weight"] = torch.ones(8) * 0.5
-            hf_sd["model.layers.0.self_attn.k_norm.weight"] = torch.ones(8) * 0.3
-            mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, 1, hf_cfg)
-            self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.q_norm.weight"],
-                                           torch.ones(8) * 1.5),
-                            f"q_norm offset wrong for {model_type}")
-            self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.k_norm.weight"],
-                                           torch.ones(8) * 1.3),
-                            f"k_norm offset wrong for {model_type}")
+        """Gemma 2 q_norm/k_norm weights get +1 applied (centered RMSNorm convention)."""
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma2", n_layer=1)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma2", n_layer=1, head_dim=8)
+        hf_sd["model.layers.0.self_attn.q_norm.weight"] = torch.ones(8) * 0.5
+        hf_sd["model.layers.0.self_attn.k_norm.weight"] = torch.ones(8) * 0.3
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, 1, hf_cfg)
+        self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.q_norm.weight"],
+                                       torch.ones(8) * 1.5),
+                        "q_norm offset wrong for gemma2")
+        self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.k_norm.weight"],
+                                       torch.ones(8) * 1.3),
+                        "k_norm offset wrong for gemma2")
+
+    def test_gemma4_qk_norm_weights_not_offset(self):
+        """Gemma 4 q_norm/k_norm weights are NOT offset (direct RMSNorm convention)."""
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma4", n_layer=1)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma4", n_layer=1, head_dim=8)
+        hf_sd["model.layers.0.self_attn.q_norm.weight"] = torch.ones(8) * 0.5
+        hf_sd["model.layers.0.self_attn.k_norm.weight"] = torch.ones(8) * 0.3
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, 1, hf_cfg)
+        self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.q_norm.weight"],
+                                       torch.ones(8) * 0.5),
+                        "q_norm should not be offset for gemma4")
+        self.assertTrue(torch.allclose(mapped["layers.1.attn_block.2.k_norm.weight"],
+                                       torch.ones(8) * 0.3),
+                        "k_norm should not be offset for gemma4")
 
     def test_gemma3_no_qk_norm_in_mapping(self):
         """Gemma 1 and Gemma 3 mapping do not produce q_norm/k_norm keys."""
