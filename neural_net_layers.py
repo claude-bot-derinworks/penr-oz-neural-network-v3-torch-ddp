@@ -26,11 +26,15 @@ class CausalSelfAttention(nn.Module):
         self.rotary_dim = rotary_dim
         self._kv_cache = None
         self._layer_idx = 0
-        rope_dim = rotary_dim if rotary_dim is not None else head_dim
-        if rope_theta is not None and rope_dim is not None:
+        if rope_theta is not None and head_dim is not None:
+            rope_dim = rotary_dim if rotary_dim is not None else head_dim
             inv_freq = 1.0 / (rope_theta ** (
-                torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim
+                torch.arange(0, rope_dim, 2, dtype=torch.float32) / head_dim
             ))
+            if rotary_dim is not None and rotary_dim < head_dim:
+                inv_freq = torch.cat([inv_freq,
+                                      torch.zeros(head_dim // 2 - rope_dim // 2,
+                                                   dtype=torch.float32)])
             self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def set_kv_cache(self, kv_cache, layer_idx: int):
@@ -91,12 +95,7 @@ class CausalSelfAttention(nn.Module):
             offset = ref_seq_len - block_size
             if self.rope_theta is not None:
                 cos, sin = self._rope_cos_sin(block_size, rope_dim, offset, q.device, q.dtype)
-                if rope_dim < head_dim:
-                    q_rot, q_pass = q[..., :rope_dim], q[..., rope_dim:]
-                    q_rot = q_rot * cos + self._rotate_half(q_rot) * sin
-                    q = torch.cat([q_rot, q_pass], dim=-1)
-                else:
-                    q = q * cos + self._rotate_half(q) * sin
+                q = q * cos + self._rotate_half(q) * sin
             k, v = self._kv_cache.get(self.kv_shared_layer_idx)
             is_causal = (block_size > 1)
         else:
@@ -109,16 +108,8 @@ class CausalSelfAttention(nn.Module):
             if self.rope_theta is not None:
                 offset = self._kv_cache.seq_len(self._layer_idx) if self._kv_cache is not None else 0
                 cos, sin = self._rope_cos_sin(block_size, rope_dim, offset, q.device, q.dtype)
-                if rope_dim < head_dim:
-                    q_rot, q_pass = q[..., :rope_dim], q[..., rope_dim:]
-                    k_rot, k_pass = k[..., :rope_dim], k[..., rope_dim:]
-                    q_rot = q_rot * cos + self._rotate_half(q_rot) * sin
-                    k_rot = k_rot * cos + self._rotate_half(k_rot) * sin
-                    q = torch.cat([q_rot, q_pass], dim=-1)
-                    k = torch.cat([k_rot, k_pass], dim=-1)
-                else:
-                    q = q * cos + self._rotate_half(q) * sin
-                    k = k * cos + self._rotate_half(k) * sin
+                q = q * cos + self._rotate_half(q) * sin
+                k = k * cos + self._rotate_half(k) * sin
             # Expand KV heads for grouped-query attention
             if self.num_kv_heads < self.num_heads:
                 n_rep = self.num_heads // self.num_kv_heads
