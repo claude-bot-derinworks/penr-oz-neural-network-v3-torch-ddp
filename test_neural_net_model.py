@@ -1284,6 +1284,28 @@ class TestNeuralNetModel(unittest.TestCase):
                 self.assertTrue(torch.equal(value, torch.ones_like(value)),
                                 f"Gemma 3 norm weight {key} should be offset by +1")
 
+    def test_partial_rotary_inv_freq_zero_padded(self):
+        """Partial RoPE zero-pads inv_freq to head_dim//2 and divides by head_dim."""
+        head_dim, rotary_dim, rope_theta = 512, 128, 1000000.0
+        attn = nnl.CausalSelfAttention(
+            num_heads=8, head_dim=head_dim, rope_theta=rope_theta,
+            rotary_dim=rotary_dim)
+        self.assertEqual(attn.inv_freq.shape[0], head_dim // 2)
+        rope_angles = rotary_dim // 2
+        self.assertTrue(torch.all(attn.inv_freq[:rope_angles] != 0))
+        self.assertTrue(torch.all(attn.inv_freq[rope_angles:] == 0))
+        expected = 1.0 / (rope_theta ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32) / head_dim))
+        self.assertTrue(torch.allclose(attn.inv_freq[:rope_angles], expected))
+
+    def test_full_rotary_inv_freq_not_padded(self):
+        """Without partial RoPE, inv_freq has head_dim//2 entries, no zero-padding."""
+        head_dim, rope_theta = 256, 10000.0
+        attn = nnl.CausalSelfAttention(
+            num_heads=8, head_dim=head_dim, rope_theta=rope_theta)
+        self.assertEqual(attn.inv_freq.shape[0], head_dim // 2)
+        self.assertTrue(torch.all(attn.inv_freq != 0))
+
     @patch("neural_net_model.NeuralNetworkModel.serialize")
     @patch("neural_net_model.load_safetensors")
     @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
