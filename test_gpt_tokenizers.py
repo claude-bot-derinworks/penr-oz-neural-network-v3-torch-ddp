@@ -1,3 +1,4 @@
+import pickle
 import unittest
 from unittest.mock import patch, MagicMock
 from gpt_tokenizers import Tokenizer
@@ -62,6 +63,18 @@ class TestTiktokenTokenizer(unittest.TestCase):
         # Even empty string should have EOT token
         self.assertEqual(len(tokens), 1)
 
+    @patch("gpt_tokenizers.tiktoken")
+    def test_picklable(self, mock_tiktoken):
+        # The tokenizer must be picklable so it can be used with multiprocessing
+        # (e.g. multiprocessing.Pool.imap in the dataset download endpoint).
+        mock_tiktoken.get_encoding.return_value = self._make_mock_enc()
+        tokenizer = Tokenizer("tiktoken/gpt2")
+
+        restored = pickle.loads(pickle.dumps(tokenizer))
+
+        self.assertEqual(restored.encoding_name, "tiktoken/gpt2")
+        self.assertEqual(restored.tokenize("Hello world"), tokenizer.tokenize("Hello world"))
+
 
 class TestAutoTokenizer(unittest.TestCase):
 
@@ -121,6 +134,18 @@ class TestAutoTokenizer(unittest.TestCase):
 
         # Even empty string should have EOS token
         self.assertEqual(len(tokens), 1)
+
+    @patch("gpt_tokenizers.AutoTokenizer")
+    def test_picklable(self, mock_auto_tokenizer):
+        # The tokenizer must be picklable so it can be used with multiprocessing
+        # (e.g. multiprocessing.Pool.imap in the dataset download endpoint).
+        mock_auto_tokenizer.from_pretrained.return_value = self._make_mock_enc()
+        tokenizer = Tokenizer("gpt2")
+
+        restored = pickle.loads(pickle.dumps(tokenizer))
+
+        self.assertEqual(restored.encoding_name, "gpt2")
+        self.assertEqual(restored.tokenize("Hello world"), tokenizer.tokenize("Hello world"))
 
 
 if __name__ == '__main__':
