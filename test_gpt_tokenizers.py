@@ -1,7 +1,7 @@
 import pickle
 import unittest
 from unittest.mock import patch, MagicMock
-from gpt_tokenizers import Tokenizer
+from gpt_tokenizers import Tokenizer, _get_cached_encoding
 
 
 class TestTiktokenTokenizer(unittest.TestCase):
@@ -67,6 +67,7 @@ class TestTiktokenTokenizer(unittest.TestCase):
     def test_picklable(self, mock_tiktoken):
         # The tokenizer must be picklable so it can be used with multiprocessing
         # (e.g. multiprocessing.Pool.imap in the dataset download endpoint).
+        _get_cached_encoding.cache_clear()
         mock_tiktoken.get_encoding.return_value = self._make_mock_enc()
         tokenizer = Tokenizer("tiktoken/gpt2")
 
@@ -139,6 +140,7 @@ class TestAutoTokenizer(unittest.TestCase):
     def test_picklable(self, mock_auto_tokenizer):
         # The tokenizer must be picklable so it can be used with multiprocessing
         # (e.g. multiprocessing.Pool.imap in the dataset download endpoint).
+        _get_cached_encoding.cache_clear()
         mock_auto_tokenizer.from_pretrained.return_value = self._make_mock_enc()
         tokenizer = Tokenizer("gpt2")
 
