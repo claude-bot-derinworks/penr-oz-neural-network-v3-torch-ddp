@@ -353,20 +353,105 @@ class TestNeuralNetModel(unittest.TestCase):
             self.assertEqual(stopped_tokens, input_context[0] + [first_generated])
 
     def _make_gemma_like_layers(self, vocab_size=16, n_embd=8, n_head=2, n_kv_heads=2,
-                                head_dim=4, intermediate_size=16):
+                                head_dim=4, intermediate_size=16, n_blocks=1,
+                                sliding_window=None):
         """Build a small Gemma-like layer config for testing."""
         qkv_dim = n_head * head_dim + 2 * n_kv_heads * head_dim
+        attn_args = {"num_heads": n_head, "num_kv_heads": n_kv_heads,
+                     "rope_theta": 10000.0, "head_dim": head_dim}
+        if sliding_window is not None:
+            attn_args["sliding_window"] = sliding_window
+        block = lambda: {"transformerblock": {
+            "attn_block": {"sequential": [
+                {"rmsnorm": {"normalized_shape": n_embd}},
+                {"linear": {"in_features": n_embd, "out_features": qkv_dim, "bias": False}},
+                {"attention": dict(attn_args)},
+                {"linear": {"in_features": n_head * head_dim, "out_features": n_embd, "bias": False}},
+            ]},
+            "mlp_block": {"sequential": [
+                {"rmsnorm": {"normalized_shape": n_embd}},
+                {"gatedmlp": {"in_features": n_embd, "intermediate_size": intermediate_size,
+                              "bias": False, "activation": "gelu_pytorch_tanh"}},
+            ]},
+            "post_attn_norm": {"rmsnorm": {"normalized_shape": n_embd}},
+            "post_mlp_norm": {"rmsnorm": {"normalized_shape": n_embd}},
+            "post_norm_on_residual": False,
+        }}
         return [
             {"scaledembedding": {
                 "num_embeddings": vocab_size, "embedding_dim": n_embd,
                 "scale": float(n_embd ** 0.5),
             }},
-            {"transformerblock": {
+            *[block() for _ in range(n_blocks)],
+            {"rmsnorm": {"normalized_shape": n_embd}},
+            {"linear": {"in_features": n_embd, "out_features": vocab_size, "bias": False}},
+            {"softmaxlast": {"dim": -1}},
+        ]
+
+    @parameterized.expand([
+        ("full_attention", None),
+        ("sliding_window_2", 2),
+        ("sliding_window_3", 3),
+    ])
+    def test_incremental_decode_matches_full_forward(self, _name, sliding_window):
+        """Token-by-token decode with KV cache must match a full-context forward.
+
+        This guards the generate path: the cached incremental logits at the
+        final position must equal the logits from a single full-sequence
+        forward.  Sliding-window layers in particular must apply their window
+        mask during incremental decode (block_size == 1), not only during
+        prefill — otherwise a single-token query attends to the whole cache.
+        """
+        torch.manual_seed(0)
+        vocab_size = 16
+        layers = self._make_gemma_like_layers(vocab_size=vocab_size, n_blocks=2,
+                                               sliding_window=sliding_window)
+        model = NeuralNetworkModel("test_decode_eq", Mapper(layers, {"sgd": {}}))
+        model.eval()
+        model.layers.training = False
+        # Randomize weights so attention is non-trivial.
+        for p in model.parameters():
+            if p.ndim >= 2:
+                nn.init.normal_(p, std=0.2)
+
+        # Sequence length deliberately exceeds the sliding window.
+        seq = [[3, 1, 4, 1, 5, 9, 2]]
+        seq_t = torch.tensor(seq, dtype=torch.long)
+
+        # Full-context forward, no cache.
+        full_acts, _ = model(seq_t, skip_softmax=True)
+        full_logits = full_acts[-1][:, -1, :]
+
+        # Incremental decode: feed one token at a time with a KV cache.
+        cache, pos_embeddings = model._attach_kv_cache()
+        try:
+            inc_logits = None
+            for tok in seq[0]:
+                inp = torch.tensor([[tok]], dtype=torch.long)
+                acts, _ = model(inp, skip_softmax=True)
+                inc_logits = acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos_embeddings)
+
+        self.assertTrue(
+            torch.allclose(full_logits, inc_logits, atol=1e-4),
+            f"Incremental decode diverged from full forward (sliding_window={sliding_window}); "
+            f"max diff={ (full_logits - inc_logits).abs().max().item() }")
+
+    def _make_kv_shared_layers(self, vocab_size=16, n_embd=8, n_head=2, n_kv_heads=1,
+                               head_dim=4, intermediate_size=16):
+        """Build a 3-block Gemma 4-style config where block 2 shares KV from block 0."""
+        qkv_dim = n_head * head_dim + 2 * n_kv_heads * head_dim
+        def block(kv_shared_layer_idx=None):
+            attn = {"num_heads": n_head, "num_kv_heads": n_kv_heads,
+                    "rope_theta": 10000.0, "head_dim": head_dim}
+            if kv_shared_layer_idx is not None:
+                attn["kv_shared_layer_idx"] = kv_shared_layer_idx
+            return {"transformerblock": {
                 "attn_block": {"sequential": [
                     {"rmsnorm": {"normalized_shape": n_embd}},
                     {"linear": {"in_features": n_embd, "out_features": qkv_dim, "bias": False}},
-                    {"attention": {"num_heads": n_head, "num_kv_heads": n_kv_heads,
-                                   "rope_theta": 10000.0, "head_dim": head_dim}},
+                    {"attention": attn},
                     {"linear": {"in_features": n_head * head_dim, "out_features": n_embd, "bias": False}},
                 ]},
                 "mlp_block": {"sequential": [
@@ -377,11 +462,59 @@ class TestNeuralNetModel(unittest.TestCase):
                 "post_attn_norm": {"rmsnorm": {"normalized_shape": n_embd}},
                 "post_mlp_norm": {"rmsnorm": {"normalized_shape": n_embd}},
                 "post_norm_on_residual": False,
-            }},
+            }}
+        return [
+            {"scaledembedding": {"num_embeddings": vocab_size, "embedding_dim": n_embd,
+                                 "scale": float(n_embd ** 0.5)}},
+            block(),                       # block 0: reference (non-shared)
+            block(),                       # block 1: non-shared
+            block(kv_shared_layer_idx=0),  # block 2: shares KV from block 0
             {"rmsnorm": {"normalized_shape": n_embd}},
             {"linear": {"in_features": n_embd, "out_features": vocab_size, "bias": False}},
             {"softmaxlast": {"dim": -1}},
         ]
+
+    def test_kv_shared_prefill_matches_incremental_decode(self):
+        """KV-shared layers: all-at-once prefill must match token-by-token decode.
+
+        Gemma 4 E2B reuses K/V from a reference layer in 20 of 35 layers.
+        Both the prefill (block_size == N) and incremental decode (block_size
+        == 1) code paths must agree at the final position, otherwise generation
+        degrades (e.g. repeating tokens) the moment decoding starts.
+        """
+        torch.manual_seed(0)
+        layers = self._make_kv_shared_layers()
+        model = NeuralNetworkModel("test_kv_shared", Mapper(layers, {"sgd": {}}))
+        model.eval()
+        model.layers.training = False
+        for p in model.parameters():
+            if p.ndim >= 2:
+                nn.init.normal_(p, std=0.2)
+
+        seq = [[3, 1, 4, 1, 5]]
+
+        # All-at-once prefill with cache.
+        cache, pos = model._attach_kv_cache()
+        try:
+            prefill_acts, _ = model(torch.tensor(seq, dtype=torch.long), skip_softmax=True)
+            prefill_logits = prefill_acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos)
+
+        # Token-by-token decode with a fresh cache.
+        cache, pos = model._attach_kv_cache()
+        try:
+            decode_logits = None
+            for tok in seq[0]:
+                acts, _ = model(torch.tensor([[tok]], dtype=torch.long), skip_softmax=True)
+                decode_logits = acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos)
+
+        self.assertTrue(
+            torch.allclose(prefill_logits, decode_logits, atol=1e-4),
+            f"KV-shared prefill vs decode diverged; "
+            f"max diff={ (prefill_logits - decode_logits).abs().max().item() }")
 
     @parameterized.expand([
         (1.0, None),

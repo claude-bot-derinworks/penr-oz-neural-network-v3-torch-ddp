@@ -127,7 +127,12 @@ class CausalSelfAttention(nn.Module):
         # apply scaled dot product attention formula
         dropout = self.dropout if self.training else 0.0
         attn_mask = None
-        if self.sliding_window is not None and is_causal:
+        # Build an explicit sliding-window mask whenever the layer is windowed.
+        # The mask encodes both causality and the local window, so it must be
+        # applied for incremental decode too (block_size == 1, is_causal False);
+        # otherwise a single-token query would attend to the entire cache,
+        # breaking local attention once the sequence exceeds the window.
+        if self.sliding_window is not None:
             kv_len = k.shape[2]
             q_abs = torch.arange(kv_len - block_size, kv_len, device=q.device)
             k_abs = torch.arange(kv_len, device=q.device)
