@@ -26,6 +26,13 @@ class CausalSelfAttention(nn.Module):
         self.rotary_dim = rotary_dim
         self._kv_cache = None
         self._layer_idx = 0
+        # KV sharing without a cache: a reference layer stores its computed
+        # K/V states (_last_kv) during forward so shared layers can reuse them.
+        # _kv_share_src is set via __dict__ in set_kv_share_source to avoid
+        # nn.Module submodule registration (it references a sibling layer).
+        self._kv_share_src = None
+        self._store_kv = False
+        self._last_kv = None
         if rope_theta is not None and head_dim is not None:
             rope_dim = rotary_dim if rotary_dim is not None else head_dim
             inv_freq = 1.0 / (rope_theta ** (
@@ -45,6 +52,16 @@ class CausalSelfAttention(nn.Module):
         """
         self._kv_cache = kv_cache
         self._layer_idx = layer_idx
+
+    def set_kv_share_source(self, source: "CausalSelfAttention"):
+        """Wire a KV-shared layer to the reference layer whose K/V it reuses.
+
+        The reference is stored via ``__dict__`` so nn.Module does not register
+        the sibling layer as a submodule (which would duplicate its parameters
+        in the state dict).
+        """
+        source._store_kv = True
+        self.__dict__["_kv_share_src"] = source
 
     @staticmethod
     def _rotate_half(x: Tensor) -> Tensor:
@@ -87,16 +104,24 @@ class CausalSelfAttention(nn.Module):
 
         rope_dim = self.rotary_dim if self.rotary_dim is not None else head_dim
 
-        if self.kv_shared_layer_idx is not None and self._kv_cache is not None:
-            # KV-shared layer: reuse reference layer's cached K/V
-            # (already after k_norm, RoPE, and GQA expansion).  Apply RoPE to
-            # own Q only; the offset matches the reference layer's position.
-            ref_seq_len = self._kv_cache.seq_len(self.kv_shared_layer_idx)
-            offset = ref_seq_len - block_size
+        # KV-shared layer: reuse reference layer's K/V states (already after
+        # k_norm, v_norm, RoPE, and GQA expansion) — from the KV cache when
+        # one is attached, otherwise from the wired reference layer's stash.
+        shared_kv = None
+        if self.kv_shared_layer_idx is not None:
+            if self._kv_cache is not None:
+                shared_kv = self._kv_cache.get(self.kv_shared_layer_idx)
+            elif self._kv_share_src is not None:
+                shared_kv = self._kv_share_src._last_kv
+
+        if shared_kv is not None and shared_kv[0] is not None:
+            k, v = shared_kv
+            # Apply RoPE to own Q only; the offset matches the reference
+            # layer's position.
+            offset = k.shape[2] - block_size
             if self.rope_theta is not None:
                 cos, sin = self._rope_cos_sin(block_size, rope_dim, offset, q.device, q.dtype)
                 q = q * cos + self._rotate_half(q) * sin
-            k, v = self._kv_cache.get(self.kv_shared_layer_idx)
             is_causal = (block_size > 1)
         else:
             k = k_raw.view(batch_size, block_size, self.num_kv_heads, head_dim).transpose(1, 2)
@@ -123,6 +148,9 @@ class CausalSelfAttention(nn.Module):
                 is_causal = (block_size > 1)
             else:
                 is_causal = True
+            # Stash full-length K/V for KV-shared layers downstream
+            if self._store_kv:
+                self._last_kv = (k, v)
 
         # apply scaled dot product attention formula
         dropout = self.dropout if self.training else 0.0

@@ -516,6 +516,77 @@ class TestNeuralNetModel(unittest.TestCase):
             f"KV-shared prefill vs decode diverged; "
             f"max diff={ (prefill_logits - decode_logits).abs().max().item() }")
 
+    def test_gemma4_numerical_parity_with_hf_transformers(self):
+        """Our mapped Gemma 4 must reproduce HF transformers logits exactly.
+
+        Builds a tiny random Gemma4ForCausalLM covering every architectural
+        feature (sliding + full attention, partial RoPE, KV-shared layers,
+        PLE, layer_scalar, GQA), maps its weights, and compares logits for:
+        plain forward (no cache), cached prefill, and token-by-token decode.
+        """
+        try:
+            from transformers import Gemma4TextConfig
+            from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        except ImportError:
+            self.skipTest("Gemma 4 not available in installed transformers")
+
+        torch.manual_seed(42)
+        cfg = Gemma4TextConfig(
+            vocab_size=64, hidden_size=32, intermediate_size=48,
+            num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=1,
+            head_dim=8, global_head_dim=16, sliding_window=4,
+            layer_types=['sliding_attention', 'full_attention',
+                         'sliding_attention', 'full_attention'],
+            num_kv_shared_layers=2, hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=64, max_position_embeddings=64,
+        )
+        hf_model = Gemma4ForCausalLM(cfg)
+        hf_model.eval()
+        with torch.no_grad():
+            for p in hf_model.parameters():
+                nn.init.normal_(p, std=0.2 if p.ndim >= 2 else 0.1)
+
+        mapped = Mapper.map_hf_state_dict_to_custom(
+            dict(hf_model.state_dict()), cfg.num_hidden_layers, cfg)
+        model = NeuralNetworkModel(
+            "test_hf_parity", Mapper(Mapper.from_hf_config(cfg), {"adamw": {"lr": 1e-4}}))
+        model.load_state_dict(mapped)
+        model.eval()
+        model.layers.training = False
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 7))
+        with torch.no_grad():
+            hf_logits = hf_model(input_ids).logits
+
+            acts, _ = model(input_ids, skip_softmax=True)
+            plain_logits = acts[-1]
+
+            cache, pos = model._attach_kv_cache()
+            try:
+                acts, _ = model(input_ids, skip_softmax=True)
+                prefill_logits = acts[-1]
+            finally:
+                model._detach_kv_cache(pos)
+
+            cache, pos = model._attach_kv_cache()
+            try:
+                decode_logits = None
+                for t in range(input_ids.shape[1]):
+                    acts, _ = model(input_ids[:, t:t + 1], skip_softmax=True)
+                    decode_logits = acts[-1]
+            finally:
+                model._detach_kv_cache(pos)
+
+        self.assertTrue(torch.allclose(hf_logits, plain_logits, atol=1e-5),
+                        f"plain forward diverged from HF; max diff="
+                        f"{(hf_logits - plain_logits).abs().max().item()}")
+        self.assertTrue(torch.allclose(hf_logits, prefill_logits, atol=1e-5),
+                        f"cached prefill diverged from HF; max diff="
+                        f"{(hf_logits - prefill_logits).abs().max().item()}")
+        self.assertTrue(torch.allclose(hf_logits[:, -1:], decode_logits, atol=1e-5),
+                        f"incremental decode diverged from HF; max diff="
+                        f"{(hf_logits[:, -1:] - decode_logits).abs().max().item()}")
+
     @parameterized.expand([
         (1.0, None),
         (1.0, 3),

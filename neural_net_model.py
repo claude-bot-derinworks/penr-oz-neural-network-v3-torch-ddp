@@ -59,6 +59,7 @@ class NeuralNetworkModel(nn.Module):
         self.layers = nn.ModuleList(self.mapper.to_layers())
         self._is_softmax_last = isinstance(self.layers[-1], nn.Softmax)
         self._wire_ple()
+        self._wire_kv_sharing()
         self.optimizer: Optimizer = self.mapper.to_optimizer(self.parameters())
         self.progress = []
         self.avg_cost = None
@@ -259,6 +260,19 @@ class NeuralNetworkModel(nn.Module):
                 os.remove(model_path)
         except FileNotFoundError as e:
             log.warning(f"Failed to delete: {str(e)}")
+
+    def _wire_kv_sharing(self):
+        """Wire KV-shared attention layers to their reference layers.
+
+        Allows shared layers to reuse the reference layer's computed K/V
+        states when no KV cache is attached (plain forward: training,
+        evaluation, compute_output), mirroring HF's shared_kv_states.
+        """
+        attn_layers = self._find_attention_layers()
+        for attn in attn_layers:
+            idx = attn.kv_shared_layer_idx
+            if idx is not None and 0 <= idx < len(attn_layers):
+                attn.set_kv_share_source(attn_layers[idx])
 
     def _wire_ple(self):
         """Connect PerLayerEmbedding modules to their TransformerBlocks."""
