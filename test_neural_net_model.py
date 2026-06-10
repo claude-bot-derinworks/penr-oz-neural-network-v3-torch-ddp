@@ -622,6 +622,47 @@ class TestNeuralNetModel(unittest.TestCase):
         for token in streamed:
             self.assertIsInstance(token, int)
 
+    @parameterized.expand([
+        (0.9, None),
+        (0.95, None),
+        (0.9, 5),
+    ])
+    def test_generate_tokens_with_top_p(self, top_p, top_k):
+        """Top-P (nucleus) sampling should produce valid tokens."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        tokens = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                       temperature=1.0, top_k=top_k, top_p=top_p)
+
+        self.assertIsNotNone(tokens)
+        self.assertGreaterEqual(len(tokens), 1)
+
+    def test_generate_tokens_stream_with_top_p(self):
+        """Streaming generation with top-p should yield valid tokens."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p_stream", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        streamed = list(model.generate_tokens_stream([[0]], block_size=8, max_new_tokens=3,
+                                                     temperature=1.0, top_p=0.95))
+
+        self.assertEqual(len(streamed), 3)
+        for token in streamed:
+            self.assertIsInstance(token, int)
+
+    def test_top_p_deterministic_with_low_threshold(self):
+        """Very low top-p should behave nearly like greedy (only the top token survives)."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p_det", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        torch.manual_seed(42)
+        tokens_top_p = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                             temperature=1.0, top_p=0.01)
+        tokens_greedy = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                              temperature=0.0)
+
+        self.assertEqual(tokens_top_p, tokens_greedy)
+
     def test_compute_output_with_bfloat16_model_converts_float_input(self):
         """compute_output must cast floating-point inputs to model dtype for bf16 models."""
         layers = [

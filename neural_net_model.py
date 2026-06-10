@@ -401,7 +401,8 @@ class NeuralNetworkModel(nn.Module):
     def _generate_next_token(self, context: Tensor, block_size: int, temperature: float,
                              top_k: int | None, softmax_layer,
                              kv_cache: KVCache | None = None,
-                             pos_embeddings: list[PositionEmbedding] | None = None) -> Tensor:
+                             pos_embeddings: list[PositionEmbedding] | None = None,
+                             top_p: float | None = None) -> Tensor:
         """Generate a single next token given the current context.
         :param context: Current token context tensor
         :param block_size: Max context length
@@ -410,6 +411,7 @@ class NeuralNetworkModel(nn.Module):
         :param softmax_layer: Softmax layer for probability computation
         :param kv_cache: Optional KV cache for incremental decoding
         :param pos_embeddings: Cached list of PositionEmbedding modules
+        :param top_p: Optional nucleus sampling threshold
         :return: next token index tensor
         """
         if kv_cache is not None and kv_cache.seq_len() > 0:
@@ -430,18 +432,33 @@ class NeuralNetworkModel(nn.Module):
         # Predict next token
         activations, _ = self(model_input, skip_softmax=True)
         logits: Tensor = activations[-1]
+        # Extract last-position logits (handle both 2D [batch, vocab] and 3D [batch, seq, vocab])
+        last_position_logits = logits[:, -1, :] if logits.ndim > 2 else logits
         if temperature == 0.0:  # zero temperature means maximum logit is next
-            next_idx = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        elif top_k is not None:  # gather next from top k result by temperature ratio
-            if top_k < logits.size(-1):
-                top_k_result = logits.topk(top_k, dim=-1)
-            else:
-                top_k_result = logits.sort(dim=-1, descending=True)
-            probs = softmax_layer.forward(top_k_result.values / temperature)
-            choice = torch.multinomial(probs.float(), num_samples=1)
-            next_idx = top_k_result.indices[:, -1, :].gather(dim=1, index=choice)
-        else:  # next from logits by temperature ratio
-            probs = softmax_layer.forward(logits / temperature)
+            next_idx = last_position_logits.argmax(dim=-1, keepdim=True)
+        else:
+            last_logits = last_position_logits / temperature
+            # Apply softcap if the softmax layer has one
+            softcap = getattr(softmax_layer, "softcap", None)
+            if softcap is not None:
+                last_logits = softcap * torch.tanh(last_logits / softcap)
+            # Apply top-k filtering first (if specified)
+            if top_k is not None and top_k < last_logits.size(-1):
+                top_k_vals, _ = last_logits.topk(top_k, dim=-1)
+                last_logits = last_logits.masked_fill(
+                    last_logits < top_k_vals[:, -1:], float("-inf"))
+            # Apply top-p (nucleus) filtering
+            if top_p is not None:
+                sorted_logits, sorted_indices = last_logits.sort(dim=-1, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1).float()
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                # Mask tokens whose cumulative probability (exclusive of their own mass)
+                # exceeds the threshold — this always keeps at least the top token
+                sorted_mask = (cumulative_probs - sorted_probs) >= top_p
+                sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+                # Scatter back to original ordering
+                last_logits = last_logits.scatter(dim=-1, index=sorted_indices, src=sorted_logits)
+            probs = torch.softmax(last_logits, dim=-1)
             next_idx = torch.multinomial(probs.float(), num_samples=1)
         return next_idx
 
@@ -475,7 +492,7 @@ class NeuralNetworkModel(nn.Module):
             pos_emb.position_offset = 0
 
     def _prepare_generation(self, input_context: list, max_new_tokens: int, temperature: float,
-                            top_k: int | None):
+                            top_k: int | None, top_p: float | None = None):
         """Common setup for token generation.
         :return: (context tensor, softmax_layer)
         """
@@ -487,8 +504,9 @@ class NeuralNetworkModel(nn.Module):
         device = first_param.device
         context = torch.tensor(input_context, dtype=torch.long, device=device)
         # log info
-        top_k_msg = "" if top_k is None else f" top {top_k}"
-        log.info(f"Generating at most {max_new_tokens}{top_k_msg} tokens with {temperature} temperature"
+        top_k_msg = "" if top_k is None else f" top-k={top_k}"
+        top_p_msg = "" if top_p is None else f" top-p={top_p}"
+        log.info(f"Generating at most {max_new_tokens}{top_k_msg}{top_p_msg} tokens with {temperature} temperature"
                  f" using device {device}")
         # prep Softmax layer
         softmax_layer = self.layers[-1] if self._is_softmax_last else SoftmaxOnLast
@@ -496,15 +514,16 @@ class NeuralNetworkModel(nn.Module):
 
     @torch.inference_mode()
     def generate_tokens(self, input_context: list, block_size: int, max_new_tokens: int,
-                        temperature=1.0, top_k: int | None=None, stop_token: int | None=None) -> list:
+                        temperature=1.0, top_k: int | None = None, stop_token: int | None = None,
+                        top_p: float | None = None) -> list:
         context, softmax_layer = self._prepare_generation(input_context, max_new_tokens,
-                                                            temperature, top_k)
+                                                          temperature, top_k, top_p)
         cache, pos_embeddings = self._attach_kv_cache()
         try:
             # generate up to max new tokens
             for sample_idx in range(max_new_tokens):
                 next_idx = self._generate_next_token(context, block_size, temperature, top_k,
-                                                     softmax_layer, cache, pos_embeddings)
+                                                     softmax_layer, cache, pos_embeddings, top_p)
                 # Append next token in for next prediction
                 context = torch.cat((context, next_idx), dim=1)
                 # Stop early if stop_token is encountered
@@ -520,7 +539,8 @@ class NeuralNetworkModel(nn.Module):
 
     @torch.inference_mode()
     def generate_tokens_stream(self, input_context: list, block_size: int, max_new_tokens: int,
-                               temperature=1.0, top_k: int | None=None, stop_token: int | None=None):
+                               temperature=1.0, top_k: int | None = None, stop_token: int | None = None,
+                               top_p: float | None = None):
         """Generate tokens one at a time, yielding each as it is produced.
         :param input_context: Initial token ids
         :param block_size: Max context length
@@ -528,17 +548,18 @@ class NeuralNetworkModel(nn.Module):
         :param temperature: Scaling factor for logits
         :param top_k: Optional top-K filtering
         :param stop_token: Optional token id that halts generation early when predicted as the next token
+        :param top_p: Optional nucleus sampling threshold
         :yields: individual token id (int)
         """
         context, softmax_layer = self._prepare_generation(input_context, max_new_tokens,
-                                                            temperature, top_k)
+                                                          temperature, top_k, top_p)
         cache, pos_embeddings = self._attach_kv_cache()
         try:
             log.info("Streaming token generation started")
             # generate up to max new tokens
             for sample_idx in range(max_new_tokens):
                 next_idx = self._generate_next_token(context, block_size, temperature, top_k,
-                                                     softmax_layer, cache, pos_embeddings)
+                                                     softmax_layer, cache, pos_embeddings, top_p)
                 # Append next token in for next prediction
                 context = torch.cat((context, next_idx), dim=1)
                 # Yield the newly generated token

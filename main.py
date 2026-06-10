@@ -231,6 +231,11 @@ class GenerateRequest(ModelOnDeviceRequest):
         examples=[None],
         description="Use Top K results"
     )
+    top_p: float | None = Field(
+        None,
+        examples=[None],
+        description="Use Top-P (nucleus) sampling — keep tokens whose cumulative probability mass is below this threshold (e.g. 0.95)"
+    )
     stop_token: int | None = Field(
         None,
         examples=[None],
@@ -428,11 +433,13 @@ def model_generate(body: GenerateRequest = Body(...)):
         log.info(f"Streaming token generation for model {model_id}")
         def token_stream():
             for token in model.generate_tokens_stream(body.input, body.block_size, body.max_new_tokens,
-                                                      body.temperature, body.top_k, body.stop_token):
+                                                      body.temperature, body.top_k, body.stop_token,
+                                                      body.top_p):
                 yield f"{token}\n"
         return StreamingResponse(token_stream(), media_type="text/plain")
     generated_tokens = model.generate_tokens(body.input, body.block_size, body.max_new_tokens,
-                                             body.temperature, body.top_k, body.stop_token)
+                                             body.temperature, body.top_k, body.stop_token,
+                                             body.top_p)
     return {"tokens": generated_tokens}
 
 @app.post("/decode/")

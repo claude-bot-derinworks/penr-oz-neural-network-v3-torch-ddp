@@ -210,7 +210,7 @@ def test_generate_endpoint_with_stop_token(mock_deserialized_model, input_contex
     assert response.status_code == 200
     assert response.json() == {"tokens": tokens}
     mock_deserialized_model.generate_tokens.assert_called_once_with(
-        input_context, block_size, max_new_tokens, 1.0, None, stop_token
+        input_context, block_size, max_new_tokens, 1.0, None, stop_token, None
     )
 
 @pytest.mark.parametrize("input_context, block_size, max_new_tokens, stop_token, tokens", [
@@ -237,7 +237,7 @@ def test_generate_stream_endpoint_with_stop_token(mock_deserialized_model, input
     expected_body = "".join(f"{t}\n" for t in tokens)
     assert response.text == expected_body
     mock_deserialized_model.generate_tokens_stream.assert_called_once_with(
-        input_context, block_size, max_new_tokens, 1.0, None, stop_token
+        input_context, block_size, max_new_tokens, 1.0, None, stop_token, None
     )
 
 @patch("main.create_task")
