@@ -64,6 +64,22 @@ class TestTiktokenTokenizer(unittest.TestCase):
         self.assertEqual(len(tokens), 1)
 
     @patch("gpt_tokenizers.tiktoken")
+    def test_tokenize_appends_eot_by_default(self, mock_tiktoken):
+        mock_tiktoken.get_encoding.return_value = self._make_mock_enc()
+        tokenizer = Tokenizer("tiktoken/gpt2")
+        tokens = tokenizer.tokenize("Hello world")
+
+        self.assertEqual(tokens, [15496, 995, 50256])
+
+    @patch("gpt_tokenizers.tiktoken")
+    def test_tokenize_without_eot_for_generation_prompt(self, mock_tiktoken):
+        mock_tiktoken.get_encoding.return_value = self._make_mock_enc()
+        tokenizer = Tokenizer("tiktoken/gpt2")
+        tokens = tokenizer.tokenize("Hello world", append_eot=False)
+
+        self.assertEqual(tokens, [15496, 995])
+
+    @patch("gpt_tokenizers.tiktoken")
     def test_picklable(self, mock_tiktoken):
         # The tokenizer must be picklable so it can be used with multiprocessing
         # (e.g. multiprocessing.Pool.imap in the dataset download endpoint).
@@ -115,6 +131,28 @@ class TestAutoTokenizer(unittest.TestCase):
 
         self.assertIsInstance(decoded_text, str)
         self.assertIn("Hello world", decoded_text)
+
+    @patch("gpt_tokenizers.AutoTokenizer")
+    def test_tokenize_appends_eos_by_default(self, mock_auto_tokenizer):
+        mock_auto_tokenizer.from_pretrained.return_value = self._make_mock_enc()
+        tokenizer = Tokenizer("gpt2")
+        tokens = tokenizer.tokenize("Hello world")
+
+        self.assertEqual(tokens, [15496, 995, 50256])
+
+    @patch("gpt_tokenizers.AutoTokenizer")
+    def test_tokenize_without_eos_uses_native_special_tokens(self, mock_auto_tokenizer):
+        mock_enc = self._make_mock_enc()
+        # Simulate a Gemma-style tokenizer that prepends BOS with add_special_tokens=True
+        mock_enc.encode.side_effect = lambda text, add_special_tokens=False: (
+            ([2] if add_special_tokens else []) + [15496, 995]
+            if text == "Hello world" else []
+        )
+        mock_auto_tokenizer.from_pretrained.return_value = mock_enc
+        tokenizer = Tokenizer("gpt2")
+        tokens = tokenizer.tokenize("Hello world", append_eot=False)
+
+        self.assertEqual(tokens, [2, 15496, 995])
 
     @patch("gpt_tokenizers.AutoTokenizer")
     def test_tokenize_decode_roundtrip(self, mock_auto_tokenizer):

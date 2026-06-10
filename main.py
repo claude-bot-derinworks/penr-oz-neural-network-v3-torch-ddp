@@ -188,6 +188,13 @@ class TokenizeTextRequest(TokenizerRequest):
         ],
         description="Text to tokenize to prepare as input for neural network"
     )
+    append_eot: bool = Field(
+        False,
+        examples=[False],
+        description="Append the end-of-text/EOS token. Use True when preparing training "
+                    "documents; keep False for generation prompts so the model continues "
+                    "the text instead of starting an unrelated fresh document"
+    )
 
 class OutputRequest(ModelRequest):
     input: list = Field(
@@ -399,7 +406,7 @@ def delete_dataset(dataset_id: str = DatasetIdQuery(...)):
 def tokenize_text(body: TokenizeTextRequest = Body(...)):
     log.info(f"Requesting tokenization of text {body.text}")
     tokenizer = Tokenizer(body.encoding)
-    tokens = tokenizer.tokenize(body.text)
+    tokens = tokenizer.tokenize(body.text, append_eot=body.append_eot)
     return {"encoding": body.encoding,
             "tokens": tokens}
 

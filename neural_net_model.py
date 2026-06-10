@@ -229,12 +229,22 @@ class NeuralNetworkModel(nn.Module):
         mapper = Mapper(layers_config, optim_config)
 
         model = cls(model_id, mapper)
-        # Keep imported weights in bfloat16 to halve memory footprint
-        model.to(dtype=torch.bfloat16)
+        # Import weights in the checkpoint's native precision: Gemma ships
+        # bfloat16 weights (keeping them bf16 is lossless and halves memory),
+        # while GPT-2 ships float32 — truncating those to bf16 measurably
+        # degrades generation quality.
+        cfg_dtype = (getattr(hf_config, "dtype", None)
+                     or getattr(hf_config, "torch_dtype", None))
+        if isinstance(cfg_dtype, str):
+            cfg_dtype = getattr(torch, cfg_dtype, None)
+        target_dtype = (cfg_dtype if isinstance(cfg_dtype, torch.dtype)
+                        and cfg_dtype.is_floating_point else torch.float32)
+        log.info(f"Importing weights as {target_dtype}")
+        model.to(dtype=target_dtype)
         model.to(device)
 
         mapped_sd = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_config,
-                                                        dtype=torch.bfloat16)
+                                                        dtype=target_dtype)
         if hasattr(hf_sd, "close"):
             hf_sd.close()
         del hf_sd
@@ -437,7 +447,9 @@ class NeuralNetworkModel(nn.Module):
         if temperature == 0.0:  # zero temperature means maximum logit is next
             next_idx = last_position_logits.argmax(dim=-1, keepdim=True)
         else:
-            last_logits = last_position_logits / temperature
+            # Sample in float32: half-precision softmax visibly quantizes the
+            # distribution for large vocabularies
+            last_logits = last_position_logits.float() / temperature
             # Apply softcap if the softmax layer has one
             softcap = getattr(softmax_layer, "softcap", None)
             if softcap is not None:
@@ -450,7 +462,7 @@ class NeuralNetworkModel(nn.Module):
             # Apply top-p (nucleus) filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = last_logits.sort(dim=-1, descending=True)
-                sorted_probs = torch.softmax(sorted_logits, dim=-1).float()
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
                 cumulative_probs = sorted_probs.cumsum(dim=-1)
                 # Mask tokens whose cumulative probability (exclusive of their own mass)
                 # exceeds the threshold — this always keeps at least the top token
@@ -459,7 +471,7 @@ class NeuralNetworkModel(nn.Module):
                 # Scatter back to original ordering
                 last_logits = last_logits.scatter(dim=-1, index=sorted_indices, src=sorted_logits)
             probs = torch.softmax(last_logits, dim=-1)
-            next_idx = torch.multinomial(probs.float(), num_samples=1)
+            next_idx = torch.multinomial(probs, num_samples=1)
         return next_idx
 
     def _find_attention_layers(self) -> list[CausalSelfAttention]:

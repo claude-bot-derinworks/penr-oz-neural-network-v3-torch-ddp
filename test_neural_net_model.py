@@ -1361,10 +1361,29 @@ class TestNeuralNetModel(unittest.TestCase):
     @patch("neural_net_model.load_safetensors")
     @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_stores_weights_in_bfloat16(self, MockConfig, mock_dl, mock_load, mock_serialize):
+    def test_from_huggingface_keeps_float32_for_fp32_checkpoints(self, MockConfig, mock_dl, mock_load, mock_serialize):
+        """GPT-2 checkpoints are float32; truncating to bf16 degrades generation."""
         n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
         hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
                                        vocab_size=vocab_size, n_positions=block_size)
+        MockConfig.from_pretrained.return_value = hf_cfg
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
+
+        model = NeuralNetworkModel.from_huggingface("my-gpt2", "gpt2")
+
+        for p in model.parameters():
+            self.assertEqual(p.dtype, torch.float32, f"Expected float32 but got {p.dtype}")
+
+    @patch("neural_net_model.NeuralNetworkModel.serialize")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
+    @patch("neural_net_model.AutoConfig")
+    def test_from_huggingface_keeps_bfloat16_for_bf16_checkpoints(self, MockConfig, mock_dl, mock_load, mock_serialize):
+        """Checkpoints with native bf16 dtype (Gemma) stay bf16 to halve memory."""
+        n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
+        hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
+                                       vocab_size=vocab_size, n_positions=block_size)
+        hf_cfg.dtype = torch.bfloat16
         MockConfig.from_pretrained.return_value = hf_cfg
         mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
 

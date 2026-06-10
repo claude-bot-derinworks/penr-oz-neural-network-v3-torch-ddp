@@ -68,9 +68,18 @@ class Tokenizer:
             return self._enc
         return None
 
-    def tokenize(self, text: str) -> list[int]:
+    def tokenize(self, text: str, append_eot: bool = True) -> list[int]:
+        """Tokenize text into token ids.
+
+        :param append_eot: Append the end-of-text/EOS token. Needed as a
+            document separator when preparing training datasets, but must be
+            False when encoding a generation prompt: a trailing EOS marks a
+            document boundary, making the model start fresh unrelated text
+            instead of continuing the prompt.
+        """
         if self._is_tiktoken:
-            return self._enc.encode_ordinary(text) + [self._enc.eot_token]
+            tokens = self._enc.encode_ordinary(text)
+            return tokens + [self._enc.eot_token] if append_eot else tokens
         if self._is_processor:
             chat_host = self._chat_host()
             if chat_host is not None:
@@ -91,6 +100,11 @@ class Tokenizer:
             enc = getattr(self._enc, "tokenizer", self._enc)
         else:
             enc = self._enc
+        if not append_eot:
+            # Generation prompt: let the tokenizer add its native special
+            # tokens (e.g. the leading <bos> Gemma models require) and do
+            # not terminate with EOS.
+            return enc.encode(text, add_special_tokens=True)
         eos_token_id = enc.eos_token_id
         return enc.encode(text, add_special_tokens=False) + (
             [eos_token_id] if eos_token_id is not None else []

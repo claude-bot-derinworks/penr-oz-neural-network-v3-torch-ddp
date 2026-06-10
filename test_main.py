@@ -478,10 +478,28 @@ def test_tokenize_endpoint(mock_tokenizer_class):
     }
     
     response = client.post("/tokenize/", json=payload)
-    
+
     assert response.status_code == 200
     assert response.json() == {"encoding": "gpt2", "tokens": [1, 2, 3, 4]}
-    mock_tokenizer.tokenize.assert_called_once_with("Hello world")
+    mock_tokenizer.tokenize.assert_called_once_with("Hello world", append_eot=False)
+
+@patch("main.Tokenizer")
+def test_tokenize_endpoint_with_append_eot(mock_tokenizer_class):
+    mock_tokenizer = MagicMock()
+    mock_tokenizer_class.return_value = mock_tokenizer
+    mock_tokenizer.tokenize.return_value = [1, 2, 3, 4, 50256]
+
+    payload = {
+        "encoding": "gpt2",
+        "text": "Hello world",
+        "append_eot": True
+    }
+
+    response = client.post("/tokenize/", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"encoding": "gpt2", "tokens": [1, 2, 3, 4, 50256]}
+    mock_tokenizer.tokenize.assert_called_once_with("Hello world", append_eot=True)
 
 @patch("main.Tokenizer")
 def test_decode_endpoint(mock_tokenizer_class):
