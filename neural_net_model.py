@@ -182,18 +182,18 @@ class NeuralNetworkModel(nn.Module):
         model_id: str,
         hf_repo_id: str,
         revision: Optional[str] = None,
-        device: str = "cpu",
     ) -> "NeuralNetworkModel":
         """Import a HuggingFace model into the internal format.
 
         Downloads config and weights from HuggingFace Hub, builds a fresh
         ``NeuralNetworkModel`` with matching architecture, maps the weights,
         serializes to disk/SHM, and returns the ready-to-use model.
+        The model is always serialized on CPU; consumer endpoints (generate,
+        train) move it to the desired device after deserialization.
 
         :param model_id: Internal model id used for serialization.
         :param hf_repo_id: HuggingFace repo id.
         :param revision: Optional HuggingFace revision / branch / tag.
-        :param device: PyTorch device string (default ``"cpu"``).
         :return: Loaded ``NeuralNetworkModel`` instance.
         """
         log.info(f"Fetching HuggingFace config for {hf_repo_id} (revision={revision})")
@@ -241,7 +241,6 @@ class NeuralNetworkModel(nn.Module):
                         and cfg_dtype.is_floating_point else torch.float32)
         log.info(f"Importing weights as {target_dtype}")
         model.to(dtype=target_dtype)
-        model.to(device)
 
         mapped_sd = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_config,
                                                         dtype=target_dtype)

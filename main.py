@@ -281,11 +281,6 @@ class ImportModelRequest(BaseModel):
         examples=[None],
         description="Optional HuggingFace revision / branch / tag"
     )
-    device: str = Field(
-        "cpu",
-        examples=["cpu", "cuda"],
-        description="PyTorch device to load the model on (default: cpu)"
-    )
 
 class ModelIdQuery(Query):
     description="The unique identifier for the model"
@@ -351,7 +346,6 @@ async def import_from_huggingface(body: ImportModelRequest = Body(...)):
             model_id,
             body.hf_repo_id,
             body.revision,
-            body.device,
         )
 
     return {

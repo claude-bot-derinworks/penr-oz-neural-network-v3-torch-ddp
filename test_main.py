@@ -536,23 +536,22 @@ def test_import_endpoint_success(mock_from_hf):
         "status": "imported",
         "message": "Model imported from HuggingFace (gpt2) and ready for use",
     }
-    mock_from_hf.assert_called_once_with("gpt2-imported", "gpt2", None, "cpu")
+    mock_from_hf.assert_called_once_with("gpt2-imported", "gpt2", None)
 
 @patch("main.NeuralNetworkModel.from_huggingface")
-def test_import_endpoint_with_revision_and_device(mock_from_hf):
+def test_import_endpoint_with_revision(mock_from_hf):
     mock_from_hf.return_value = MagicMock()
 
     payload = {
         "hf_repo_id": "openai-community/gpt2-medium",
         "model_id": "gpt2-medium",
         "revision": "main",
-        "device": "cuda",
     }
 
     response = client.post("/import/", json=payload)
 
     assert response.status_code == 200
-    mock_from_hf.assert_called_once_with("gpt2-medium", "openai-community/gpt2-medium", "main", "cuda")
+    mock_from_hf.assert_called_once_with("gpt2-medium", "openai-community/gpt2-medium", "main")
 
 def test_import_endpoint_conflict():
     lock = asyncio.Lock()
