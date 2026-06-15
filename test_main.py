@@ -210,7 +210,7 @@ def test_generate_endpoint_with_stop_token(mock_deserialized_model, input_contex
     assert response.status_code == 200
     assert response.json() == {"tokens": tokens}
     mock_deserialized_model.generate_tokens.assert_called_once_with(
-        input_context, block_size, max_new_tokens, 1.0, None, stop_token
+        input_context, block_size, max_new_tokens, 1.0, None, stop_token, None
     )
 
 @pytest.mark.parametrize("input_context, block_size, max_new_tokens, stop_token, tokens", [
@@ -237,7 +237,7 @@ def test_generate_stream_endpoint_with_stop_token(mock_deserialized_model, input
     expected_body = "".join(f"{t}\n" for t in tokens)
     assert response.text == expected_body
     mock_deserialized_model.generate_tokens_stream.assert_called_once_with(
-        input_context, block_size, max_new_tokens, 1.0, None, stop_token
+        input_context, block_size, max_new_tokens, 1.0, None, stop_token, None
     )
 
 @patch("main.create_task")
@@ -478,10 +478,28 @@ def test_tokenize_endpoint(mock_tokenizer_class):
     }
     
     response = client.post("/tokenize/", json=payload)
-    
+
     assert response.status_code == 200
     assert response.json() == {"encoding": "gpt2", "tokens": [1, 2, 3, 4]}
-    mock_tokenizer.tokenize.assert_called_once_with("Hello world")
+    mock_tokenizer.tokenize.assert_called_once_with("Hello world", append_eot=False)
+
+@patch("main.Tokenizer")
+def test_tokenize_endpoint_with_append_eot(mock_tokenizer_class):
+    mock_tokenizer = MagicMock()
+    mock_tokenizer_class.return_value = mock_tokenizer
+    mock_tokenizer.tokenize.return_value = [1, 2, 3, 4, 50256]
+
+    payload = {
+        "encoding": "gpt2",
+        "text": "Hello world",
+        "append_eot": True
+    }
+
+    response = client.post("/tokenize/", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"encoding": "gpt2", "tokens": [1, 2, 3, 4, 50256]}
+    mock_tokenizer.tokenize.assert_called_once_with("Hello world", append_eot=True)
 
 @patch("main.Tokenizer")
 def test_decode_endpoint(mock_tokenizer_class):
@@ -518,23 +536,22 @@ def test_import_endpoint_success(mock_from_hf):
         "status": "imported",
         "message": "Model imported from HuggingFace (gpt2) and ready for use",
     }
-    mock_from_hf.assert_called_once_with("gpt2-imported", "gpt2", None, "cpu")
+    mock_from_hf.assert_called_once_with("gpt2-imported", "gpt2", None)
 
 @patch("main.NeuralNetworkModel.from_huggingface")
-def test_import_endpoint_with_revision_and_device(mock_from_hf):
+def test_import_endpoint_with_revision(mock_from_hf):
     mock_from_hf.return_value = MagicMock()
 
     payload = {
         "hf_repo_id": "openai-community/gpt2-medium",
         "model_id": "gpt2-medium",
         "revision": "main",
-        "device": "cuda",
     }
 
     response = client.post("/import/", json=payload)
 
     assert response.status_code == 200
-    mock_from_hf.assert_called_once_with("gpt2-medium", "openai-community/gpt2-medium", "main", "cuda")
+    mock_from_hf.assert_called_once_with("gpt2-medium", "openai-community/gpt2-medium", "main")
 
 def test_import_endpoint_conflict():
     lock = asyncio.Lock()

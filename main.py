@@ -188,6 +188,13 @@ class TokenizeTextRequest(TokenizerRequest):
         ],
         description="Text to tokenize to prepare as input for neural network"
     )
+    append_eot: bool = Field(
+        False,
+        examples=[False],
+        description="Append the end-of-text/EOS token. Use True when preparing training "
+                    "documents; keep False for generation prompts so the model continues "
+                    "the text instead of starting an unrelated fresh document"
+    )
 
 class OutputRequest(ModelRequest):
     input: list = Field(
@@ -203,7 +210,7 @@ class OutputRequest(ModelRequest):
         description="The expected target data (Optional)"
     )
 
-class GenerateRequest(ModelRequest):
+class GenerateRequest(ModelOnDeviceRequest):
     input: list = Field(
         ...,
         examples=[
@@ -230,6 +237,11 @@ class GenerateRequest(ModelRequest):
         None,
         examples=[None],
         description="Use Top K results"
+    )
+    top_p: float | None = Field(
+        None,
+        examples=[None],
+        description="Use Top-P (nucleus) sampling — keep tokens whose cumulative probability mass is below this threshold (e.g. 0.95)"
     )
     stop_token: int | None = Field(
         None,
@@ -268,11 +280,6 @@ class ImportModelRequest(BaseModel):
         None,
         examples=[None],
         description="Optional HuggingFace revision / branch / tag"
-    )
-    device: str = Field(
-        "cpu",
-        examples=["cpu", "cuda"],
-        description="PyTorch device to load the model on (default: cpu)"
     )
 
 class ModelIdQuery(Query):
@@ -339,7 +346,6 @@ async def import_from_huggingface(body: ImportModelRequest = Body(...)):
             model_id,
             body.hf_repo_id,
             body.revision,
-            body.device,
         )
 
     return {
@@ -394,7 +400,7 @@ def delete_dataset(dataset_id: str = DatasetIdQuery(...)):
 def tokenize_text(body: TokenizeTextRequest = Body(...)):
     log.info(f"Requesting tokenization of text {body.text}")
     tokenizer = Tokenizer(body.encoding)
-    tokens = tokenizer.tokenize(body.text)
+    tokens = tokenizer.tokenize(body.text, append_eot=body.append_eot)
     return {"encoding": body.encoding,
             "tokens": tokens}
 
@@ -420,17 +426,21 @@ def evaluate_model(body: EvaluateRequest = Body(...)):
 @app.post("/generate/")
 def model_generate(body: GenerateRequest = Body(...)):
     model_id = body.model_id
-    log.info(f"Generating tokens using model {model_id}")
+    device = body.device
+    log.info(f"Generating tokens using model {model_id} on device {device}")
     model = NeuralNetworkModel.deserialize(model_id)
+    model.to(device=device)
     if body.stream:
         log.info(f"Streaming token generation for model {model_id}")
         def token_stream():
             for token in model.generate_tokens_stream(body.input, body.block_size, body.max_new_tokens,
-                                                      body.temperature, body.top_k, body.stop_token):
+                                                      body.temperature, body.top_k, body.stop_token,
+                                                      body.top_p):
                 yield f"{token}\n"
         return StreamingResponse(token_stream(), media_type="text/plain")
     generated_tokens = model.generate_tokens(body.input, body.block_size, body.max_new_tokens,
-                                             body.temperature, body.top_k, body.stop_token)
+                                             body.temperature, body.top_k, body.stop_token,
+                                             body.top_p)
     return {"tokens": generated_tokens}
 
 @app.post("/decode/")

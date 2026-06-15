@@ -353,20 +353,105 @@ class TestNeuralNetModel(unittest.TestCase):
             self.assertEqual(stopped_tokens, input_context[0] + [first_generated])
 
     def _make_gemma_like_layers(self, vocab_size=16, n_embd=8, n_head=2, n_kv_heads=2,
-                                head_dim=4, intermediate_size=16):
+                                head_dim=4, intermediate_size=16, n_blocks=1,
+                                sliding_window=None):
         """Build a small Gemma-like layer config for testing."""
         qkv_dim = n_head * head_dim + 2 * n_kv_heads * head_dim
+        attn_args = {"num_heads": n_head, "num_kv_heads": n_kv_heads,
+                     "rope_theta": 10000.0, "head_dim": head_dim}
+        if sliding_window is not None:
+            attn_args["sliding_window"] = sliding_window
+        block = lambda: {"transformerblock": {
+            "attn_block": {"sequential": [
+                {"rmsnorm": {"normalized_shape": n_embd}},
+                {"linear": {"in_features": n_embd, "out_features": qkv_dim, "bias": False}},
+                {"attention": dict(attn_args)},
+                {"linear": {"in_features": n_head * head_dim, "out_features": n_embd, "bias": False}},
+            ]},
+            "mlp_block": {"sequential": [
+                {"rmsnorm": {"normalized_shape": n_embd}},
+                {"gatedmlp": {"in_features": n_embd, "intermediate_size": intermediate_size,
+                              "bias": False, "activation": "gelu_pytorch_tanh"}},
+            ]},
+            "post_attn_norm": {"rmsnorm": {"normalized_shape": n_embd}},
+            "post_mlp_norm": {"rmsnorm": {"normalized_shape": n_embd}},
+            "post_norm_on_residual": False,
+        }}
         return [
             {"scaledembedding": {
                 "num_embeddings": vocab_size, "embedding_dim": n_embd,
                 "scale": float(n_embd ** 0.5),
             }},
-            {"transformerblock": {
+            *[block() for _ in range(n_blocks)],
+            {"rmsnorm": {"normalized_shape": n_embd}},
+            {"linear": {"in_features": n_embd, "out_features": vocab_size, "bias": False}},
+            {"softmaxlast": {"dim": -1}},
+        ]
+
+    @parameterized.expand([
+        ("full_attention", None),
+        ("sliding_window_2", 2),
+        ("sliding_window_3", 3),
+    ])
+    def test_incremental_decode_matches_full_forward(self, _name, sliding_window):
+        """Token-by-token decode with KV cache must match a full-context forward.
+
+        This guards the generate path: the cached incremental logits at the
+        final position must equal the logits from a single full-sequence
+        forward.  Sliding-window layers in particular must apply their window
+        mask during incremental decode (block_size == 1), not only during
+        prefill — otherwise a single-token query attends to the whole cache.
+        """
+        torch.manual_seed(0)
+        vocab_size = 16
+        layers = self._make_gemma_like_layers(vocab_size=vocab_size, n_blocks=2,
+                                               sliding_window=sliding_window)
+        model = NeuralNetworkModel("test_decode_eq", Mapper(layers, {"sgd": {}}))
+        model.eval()
+        model.layers.training = False
+        # Randomize weights so attention is non-trivial.
+        for p in model.parameters():
+            if p.ndim >= 2:
+                nn.init.normal_(p, std=0.2)
+
+        # Sequence length deliberately exceeds the sliding window.
+        seq = [[3, 1, 4, 1, 5, 9, 2]]
+        seq_t = torch.tensor(seq, dtype=torch.long)
+
+        # Full-context forward, no cache.
+        full_acts, _ = model(seq_t, skip_softmax=True)
+        full_logits = full_acts[-1][:, -1, :]
+
+        # Incremental decode: feed one token at a time with a KV cache.
+        cache, pos_embeddings = model._attach_kv_cache()
+        try:
+            inc_logits = None
+            for tok in seq[0]:
+                inp = torch.tensor([[tok]], dtype=torch.long)
+                acts, _ = model(inp, skip_softmax=True)
+                inc_logits = acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos_embeddings)
+
+        self.assertTrue(
+            torch.allclose(full_logits, inc_logits, atol=1e-4),
+            f"Incremental decode diverged from full forward (sliding_window={sliding_window}); "
+            f"max diff={ (full_logits - inc_logits).abs().max().item() }")
+
+    def _make_kv_shared_layers(self, vocab_size=16, n_embd=8, n_head=2, n_kv_heads=1,
+                               head_dim=4, intermediate_size=16):
+        """Build a 3-block Gemma 4-style config where block 2 shares KV from block 0."""
+        qkv_dim = n_head * head_dim + 2 * n_kv_heads * head_dim
+        def block(kv_shared_layer_idx=None):
+            attn = {"num_heads": n_head, "num_kv_heads": n_kv_heads,
+                    "rope_theta": 10000.0, "head_dim": head_dim}
+            if kv_shared_layer_idx is not None:
+                attn["kv_shared_layer_idx"] = kv_shared_layer_idx
+            return {"transformerblock": {
                 "attn_block": {"sequential": [
                     {"rmsnorm": {"normalized_shape": n_embd}},
                     {"linear": {"in_features": n_embd, "out_features": qkv_dim, "bias": False}},
-                    {"attention": {"num_heads": n_head, "num_kv_heads": n_kv_heads,
-                                   "rope_theta": 10000.0, "head_dim": head_dim}},
+                    {"attention": attn},
                     {"linear": {"in_features": n_head * head_dim, "out_features": n_embd, "bias": False}},
                 ]},
                 "mlp_block": {"sequential": [
@@ -376,12 +461,131 @@ class TestNeuralNetModel(unittest.TestCase):
                 ]},
                 "post_attn_norm": {"rmsnorm": {"normalized_shape": n_embd}},
                 "post_mlp_norm": {"rmsnorm": {"normalized_shape": n_embd}},
-                "post_norm_on_residual": True,
-            }},
+                "post_norm_on_residual": False,
+            }}
+        return [
+            {"scaledembedding": {"num_embeddings": vocab_size, "embedding_dim": n_embd,
+                                 "scale": float(n_embd ** 0.5)}},
+            block(),                       # block 0: reference (non-shared)
+            block(),                       # block 1: non-shared
+            block(kv_shared_layer_idx=0),  # block 2: shares KV from block 0
             {"rmsnorm": {"normalized_shape": n_embd}},
             {"linear": {"in_features": n_embd, "out_features": vocab_size, "bias": False}},
             {"softmaxlast": {"dim": -1}},
         ]
+
+    def test_kv_shared_prefill_matches_incremental_decode(self):
+        """KV-shared layers: all-at-once prefill must match token-by-token decode.
+
+        Gemma 4 E2B reuses K/V from a reference layer in 20 of 35 layers.
+        Both the prefill (block_size == N) and incremental decode (block_size
+        == 1) code paths must agree at the final position, otherwise generation
+        degrades (e.g. repeating tokens) the moment decoding starts.
+        """
+        torch.manual_seed(0)
+        layers = self._make_kv_shared_layers()
+        model = NeuralNetworkModel("test_kv_shared", Mapper(layers, {"sgd": {}}))
+        model.eval()
+        model.layers.training = False
+        for p in model.parameters():
+            if p.ndim >= 2:
+                nn.init.normal_(p, std=0.2)
+
+        seq = [[3, 1, 4, 1, 5]]
+
+        # All-at-once prefill with cache.
+        cache, pos = model._attach_kv_cache()
+        try:
+            prefill_acts, _ = model(torch.tensor(seq, dtype=torch.long), skip_softmax=True)
+            prefill_logits = prefill_acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos)
+
+        # Token-by-token decode with a fresh cache.
+        cache, pos = model._attach_kv_cache()
+        try:
+            decode_logits = None
+            for tok in seq[0]:
+                acts, _ = model(torch.tensor([[tok]], dtype=torch.long), skip_softmax=True)
+                decode_logits = acts[-1][:, -1, :]
+        finally:
+            model._detach_kv_cache(pos)
+
+        self.assertTrue(
+            torch.allclose(prefill_logits, decode_logits, atol=1e-4),
+            f"KV-shared prefill vs decode diverged; "
+            f"max diff={ (prefill_logits - decode_logits).abs().max().item() }")
+
+    def test_gemma4_numerical_parity_with_hf_transformers(self):
+        """Our mapped Gemma 4 must reproduce HF transformers logits exactly.
+
+        Builds a tiny random Gemma4ForCausalLM covering every architectural
+        feature (sliding + full attention, partial RoPE, KV-shared layers,
+        PLE, layer_scalar, GQA), maps its weights, and compares logits for:
+        plain forward (no cache), cached prefill, and token-by-token decode.
+        """
+        try:
+            from transformers import Gemma4TextConfig
+            from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+        except ImportError:
+            self.skipTest("Gemma 4 not available in installed transformers")
+
+        torch.manual_seed(42)
+        cfg = Gemma4TextConfig(
+            vocab_size=64, hidden_size=32, intermediate_size=48,
+            num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=1,
+            head_dim=8, global_head_dim=16, sliding_window=4,
+            layer_types=['sliding_attention', 'full_attention',
+                         'sliding_attention', 'full_attention'],
+            num_kv_shared_layers=2, hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=64, max_position_embeddings=64,
+        )
+        hf_model = Gemma4ForCausalLM(cfg)
+        hf_model.eval()
+        with torch.no_grad():
+            for p in hf_model.parameters():
+                nn.init.normal_(p, std=0.2 if p.ndim >= 2 else 0.1)
+
+        mapped = Mapper.map_hf_state_dict_to_custom(
+            dict(hf_model.state_dict()), cfg.num_hidden_layers, cfg)
+        model = NeuralNetworkModel(
+            "test_hf_parity", Mapper(Mapper.from_hf_config(cfg), {"adamw": {"lr": 1e-4}}))
+        model.load_state_dict(mapped)
+        model.eval()
+        model.layers.training = False
+
+        input_ids = torch.randint(0, cfg.vocab_size, (1, 7))
+        with torch.no_grad():
+            hf_logits = hf_model(input_ids).logits
+
+            acts, _ = model(input_ids, skip_softmax=True)
+            plain_logits = acts[-1]
+
+            cache, pos = model._attach_kv_cache()
+            try:
+                acts, _ = model(input_ids, skip_softmax=True)
+                prefill_logits = acts[-1]
+            finally:
+                model._detach_kv_cache(pos)
+
+            cache, pos = model._attach_kv_cache()
+            try:
+                decode_logits = None
+                for t in range(input_ids.shape[1]):
+                    acts, _ = model(input_ids[:, t:t + 1], skip_softmax=True)
+                    decode_logits = acts[-1]
+            finally:
+                model._detach_kv_cache(pos)
+
+        self.assertTrue(torch.allclose(hf_logits, plain_logits, atol=1e-5),
+                        f"plain forward diverged from HF; max diff="
+                        f"{(hf_logits - plain_logits).abs().max().item()}")
+        self.assertTrue(torch.allclose(hf_logits, prefill_logits, atol=1e-5),
+                        f"cached prefill diverged from HF; max diff="
+                        f"{(hf_logits - prefill_logits).abs().max().item()}")
+        self.assertTrue(torch.allclose(hf_logits[:, -1:], decode_logits, atol=1e-5),
+                        f"incremental decode diverged from HF; max diff="
+                        f"{(hf_logits[:, -1:] - decode_logits).abs().max().item()}")
 
     @parameterized.expand([
         (1.0, None),
@@ -417,6 +621,47 @@ class TestNeuralNetModel(unittest.TestCase):
         self.assertEqual(len(streamed), 3)
         for token in streamed:
             self.assertIsInstance(token, int)
+
+    @parameterized.expand([
+        (0.9, None),
+        (0.95, None),
+        (0.9, 5),
+    ])
+    def test_generate_tokens_with_top_p(self, top_p, top_k):
+        """Top-P (nucleus) sampling should produce valid tokens."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        tokens = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                       temperature=1.0, top_k=top_k, top_p=top_p)
+
+        self.assertIsNotNone(tokens)
+        self.assertGreaterEqual(len(tokens), 1)
+
+    def test_generate_tokens_stream_with_top_p(self):
+        """Streaming generation with top-p should yield valid tokens."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p_stream", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        streamed = list(model.generate_tokens_stream([[0]], block_size=8, max_new_tokens=3,
+                                                     temperature=1.0, top_p=0.95))
+
+        self.assertEqual(len(streamed), 3)
+        for token in streamed:
+            self.assertIsInstance(token, int)
+
+    def test_top_p_deterministic_with_low_threshold(self):
+        """Very low top-p should behave nearly like greedy (only the top token survives)."""
+        layers = self._make_gemma_like_layers()
+        model = NeuralNetworkModel("test_top_p_det", Mapper(layers, {"adamw": {"lr": 1e-4}}))
+
+        torch.manual_seed(42)
+        tokens_top_p = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                             temperature=1.0, top_p=0.01)
+        tokens_greedy = model.generate_tokens([[0]], block_size=8, max_new_tokens=5,
+                                              temperature=0.0)
+
+        self.assertEqual(tokens_top_p, tokens_greedy)
 
     def test_compute_output_with_bfloat16_model_converts_float_input(self):
         """compute_output must cast floating-point inputs to model dtype for bf16 models."""
@@ -1001,12 +1246,8 @@ class TestNeuralNetModel(unittest.TestCase):
         cfg.resid_pdrop = 0.0
         cfg.embd_pdrop  = 0.0
         cfg.attn_pdrop  = 0.0
+        cfg.to_dict = lambda: {}
         return cfg
-
-    def _make_hf_model_mock(self, hf_sd):
-        hf_model = MagicMock()
-        hf_model.state_dict.return_value = hf_sd
-        return hf_model
 
     def _make_hf_sd(self, n_layer, n_embd, vocab_size, block_size):
         sd = {}
@@ -1052,16 +1293,63 @@ class TestNeuralNetModel(unittest.TestCase):
         mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer)
         self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()))
 
+    def test_mapped_keys_match_with_safetensors_tied_weights(self):
+        """Safetensors deduplicates tied weights, keeping only lm_head.weight."""
+        n_layer, n_embd, n_head, vocab_size, block_size = 2, 32, 2, 64, 16
+
+        hf_sd = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
+        wte = hf_sd.pop("transformer.wte.weight")
+        hf_sd["lm_head.weight"] = wte
+
+        hf_cfg = MagicMock()
+        hf_cfg.vocab_size = vocab_size
+        hf_cfg.n_embd = n_embd
+        hf_cfg.n_head = n_head
+        hf_cfg.n_layer = n_layer
+        hf_cfg.n_positions = block_size
+        hf_cfg.resid_pdrop = 0.0
+        hf_cfg.embd_pdrop  = 0.0
+        hf_cfg.attn_pdrop  = 0.0
+
+        layers_config = Mapper.from_hf_config(hf_cfg)
+        model = NeuralNetworkModel("tmp", Mapper(layers_config, {"adamw": {"lr": 1e-4, "betas": [0.9, 0.95], "eps": 1e-8}}))
+
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer)
+        self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()))
+
+    def test_mapped_keys_match_without_transformer_prefix(self):
+        """Safetensors saved from GPT2Model omit the 'transformer.' prefix."""
+        n_layer, n_embd, n_head, vocab_size, block_size = 2, 32, 2, 64, 16
+
+        hf_sd = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
+        unprefixed = {k.replace("transformer.", ""): v for k, v in hf_sd.items()}
+
+        hf_cfg = MagicMock()
+        hf_cfg.vocab_size = vocab_size
+        hf_cfg.n_embd = n_embd
+        hf_cfg.n_head = n_head
+        hf_cfg.n_layer = n_layer
+        hf_cfg.n_positions = block_size
+        hf_cfg.resid_pdrop = 0.0
+        hf_cfg.embd_pdrop  = 0.0
+        hf_cfg.attn_pdrop  = 0.0
+
+        layers_config = Mapper.from_hf_config(hf_cfg)
+        model = NeuralNetworkModel("tmp", Mapper(layers_config, {"adamw": {"lr": 1e-4, "betas": [0.9, 0.95], "eps": 1e-8}}))
+
+        mapped = Mapper.map_hf_state_dict_to_custom(unprefixed, n_layer)
+        self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()))
+
     @patch("neural_net_model.NeuralNetworkModel.serialize")
-    @patch("neural_net_model.AutoModelForCausalLM")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_returns_model(self, MockConfig, MockModel, mock_serialize):
+    def test_from_huggingface_returns_model(self, MockConfig, mock_dl, mock_load, mock_serialize):
         n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
         hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
                                        vocab_size=vocab_size, n_positions=block_size)
         MockConfig.from_pretrained.return_value = hf_cfg
-        MockModel.from_pretrained.return_value = self._make_hf_model_mock(
-            self._make_hf_sd(n_layer, n_embd, vocab_size, block_size))
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
 
         model = NeuralNetworkModel.from_huggingface("my-gpt2", "gpt2")
 
@@ -1070,15 +1358,34 @@ class TestNeuralNetModel(unittest.TestCase):
         mock_serialize.assert_called_once()
 
     @patch("neural_net_model.NeuralNetworkModel.serialize")
-    @patch("neural_net_model.AutoModelForCausalLM")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_stores_weights_in_bfloat16(self, MockConfig, MockModel, mock_serialize):
+    def test_from_huggingface_keeps_float32_for_fp32_checkpoints(self, MockConfig, mock_dl, mock_load, mock_serialize):
+        """GPT-2 checkpoints are float32; truncating to bf16 degrades generation."""
         n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
         hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
                                        vocab_size=vocab_size, n_positions=block_size)
         MockConfig.from_pretrained.return_value = hf_cfg
-        MockModel.from_pretrained.return_value = self._make_hf_model_mock(
-            self._make_hf_sd(n_layer, n_embd, vocab_size, block_size))
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
+
+        model = NeuralNetworkModel.from_huggingface("my-gpt2", "gpt2")
+
+        for p in model.parameters():
+            self.assertEqual(p.dtype, torch.float32, f"Expected float32 but got {p.dtype}")
+
+    @patch("neural_net_model.NeuralNetworkModel.serialize")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
+    @patch("neural_net_model.AutoConfig")
+    def test_from_huggingface_keeps_bfloat16_for_bf16_checkpoints(self, MockConfig, mock_dl, mock_load, mock_serialize):
+        """Checkpoints with native bf16 dtype (Gemma) stay bf16 to halve memory."""
+        n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
+        hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
+                                       vocab_size=vocab_size, n_positions=block_size)
+        hf_cfg.dtype = torch.bfloat16
+        MockConfig.from_pretrained.return_value = hf_cfg
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
 
         model = NeuralNetworkModel.from_huggingface("my-gpt2", "gpt2")
 
@@ -1086,15 +1393,15 @@ class TestNeuralNetModel(unittest.TestCase):
             self.assertEqual(p.dtype, torch.bfloat16, f"Expected bfloat16 but got {p.dtype}")
 
     @patch("neural_net_model.NeuralNetworkModel.serialize")
-    @patch("neural_net_model.AutoModelForCausalLM")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_status_code(self, MockConfig, MockModel, mock_serialize):
+    def test_from_huggingface_status_code(self, MockConfig, mock_dl, mock_load, mock_serialize):
         n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
         hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
                                        vocab_size=vocab_size, n_positions=block_size)
         MockConfig.from_pretrained.return_value = hf_cfg
-        MockModel.from_pretrained.return_value = self._make_hf_model_mock(
-            self._make_hf_sd(n_layer, n_embd, vocab_size, block_size))
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
 
         model = NeuralNetworkModel.from_huggingface("my-gpt2", "gpt2")
 
@@ -1102,22 +1409,21 @@ class TestNeuralNetModel(unittest.TestCase):
         self.assertIn("gpt2", model.status["message"])
 
     @patch("neural_net_model.NeuralNetworkModel.serialize")
-    @patch("neural_net_model.AutoModelForCausalLM")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_passes_revision(self, MockConfig, MockModel, mock_serialize):
+    def test_from_huggingface_passes_revision(self, MockConfig, mock_dl, mock_load, mock_serialize):
         n_layer, n_embd, vocab_size, block_size = 1, 32, 64, 16
         hf_cfg = self._make_hf_config(n_layer=n_layer, n_embd=n_embd,
                                        vocab_size=vocab_size, n_positions=block_size)
         MockConfig.from_pretrained.return_value = hf_cfg
-        MockModel.from_pretrained.return_value = self._make_hf_model_mock(
-            self._make_hf_sd(n_layer, n_embd, vocab_size, block_size))
+        mock_load.return_value = self._make_hf_sd(n_layer, n_embd, vocab_size, block_size)
 
         NeuralNetworkModel.from_huggingface("m", "gpt2", revision="main")
 
         MockConfig.from_pretrained.assert_called_once_with("gpt2", revision="main")
-        MockModel.from_pretrained.assert_called_once_with(
-            "gpt2", revision="main", dtype=torch.bfloat16, low_cpu_mem_usage=True
-        )
+        mock_dl.assert_called_once()
+        self.assertEqual(mock_dl.call_args[1].get("revision"), "main")
 
 
     # ---- Gemma import tests ----
@@ -1139,6 +1445,7 @@ class TestNeuralNetModel(unittest.TestCase):
         cfg.rope_theta = 10000.0
         cfg.attention_dropout = 0.0
         cfg.hidden_activation = "gelu_pytorch_tanh"
+        cfg.to_dict = lambda: {}
         return cfg
 
     def _make_gemma_hf_sd(self, model_type="gemma3", n_layer=1, n_embd=32,
@@ -1156,6 +1463,9 @@ class TestNeuralNetModel(unittest.TestCase):
             sd[f"{p}.self_attn.k_proj.weight"] = torch.zeros(n_kv_heads * head_dim, n_embd)
             sd[f"{p}.self_attn.v_proj.weight"] = torch.zeros(n_kv_heads * head_dim, n_embd)
             sd[f"{p}.self_attn.o_proj.weight"] = torch.zeros(n_embd, n_head * head_dim)
+            if model_type in ("gemma2", "gemma4", "gemma4_text"):
+                sd[f"{p}.self_attn.q_norm.weight"] = torch.zeros(head_dim)
+                sd[f"{p}.self_attn.k_norm.weight"] = torch.zeros(head_dim)
             if has_post_norms:
                 sd[f"{p}.post_attention_layernorm.weight"] = torch.zeros(n_embd)
                 sd[f"{p}.pre_feedforward_layernorm.weight"] = torch.zeros(n_embd)
@@ -1165,12 +1475,14 @@ class TestNeuralNetModel(unittest.TestCase):
             sd[f"{p}.mlp.gate_proj.weight"] = torch.zeros(intermediate_size, n_embd)
             sd[f"{p}.mlp.up_proj.weight"] = torch.zeros(intermediate_size, n_embd)
             sd[f"{p}.mlp.down_proj.weight"] = torch.zeros(n_embd, intermediate_size)
+            if model_type in ("gemma4", "gemma4_text"):
+                sd[f"{p}.layer_scalar"] = torch.ones(1)
         sd[f"{pfx}.norm.weight"] = torch.zeros(n_embd)
         return sd
 
     def test_gemma_mapped_keys_match_model_state_dict(self):
         """Mapped Gemma keys must exactly match a fresh model's state dict."""
-        for model_type in ("gemma", "gemma3"):
+        for model_type in ("gemma", "gemma3", "gemma4"):
             n_layer, n_embd, n_head, n_kv_heads, head_dim = 2, 32, 4, 2, 8
             vocab_size, intermediate_size = 64, 64
             hf_sd = self._make_gemma_hf_sd(model_type=model_type, n_layer=n_layer,
@@ -1192,10 +1504,77 @@ class TestNeuralNetModel(unittest.TestCase):
             self.assertEqual(set(mapped.keys()), set(model.state_dict().keys()),
                              f"Key mismatch for {model_type}")
 
+    def test_gemma4_norm_weights_not_offset(self):
+        """Gemma 4 uses direct RMSNorm convention — norm weights must NOT be offset by +1."""
+        n_layer, n_embd, n_head, n_kv_heads, head_dim = 1, 32, 4, 2, 8
+        vocab_size, intermediate_size = 64, 64
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma4", n_layer=n_layer,
+                                         n_embd=n_embd, n_head=n_head,
+                                         n_kv_heads=n_kv_heads, head_dim=head_dim,
+                                         vocab_size=vocab_size,
+                                         intermediate_size=intermediate_size)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma4", n_layer=n_layer,
+                                              hidden_size=n_embd,
+                                              num_attention_heads=n_head,
+                                              num_key_value_heads=n_kv_heads,
+                                              head_dim=head_dim,
+                                              vocab_size=vocab_size,
+                                              intermediate_size=intermediate_size)
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
+        for key, value in mapped.items():
+            if "norm" in key or "layernorm" in key:
+                self.assertTrue(torch.equal(value, torch.zeros_like(value)),
+                                f"Gemma 4 norm weight {key} should not be offset by +1")
+
+    def test_gemma3_norm_weights_offset_by_one(self):
+        """Gemma 3 uses centered RMSNorm convention — norm weights must be offset by +1."""
+        n_layer, n_embd, n_head, n_kv_heads, head_dim = 1, 32, 4, 2, 8
+        vocab_size, intermediate_size = 64, 64
+        hf_sd = self._make_gemma_hf_sd(model_type="gemma3", n_layer=n_layer,
+                                         n_embd=n_embd, n_head=n_head,
+                                         n_kv_heads=n_kv_heads, head_dim=head_dim,
+                                         vocab_size=vocab_size,
+                                         intermediate_size=intermediate_size)
+        hf_cfg = self._make_gemma_hf_config(model_type="gemma3", n_layer=n_layer,
+                                              hidden_size=n_embd,
+                                              num_attention_heads=n_head,
+                                              num_key_value_heads=n_kv_heads,
+                                              head_dim=head_dim,
+                                              vocab_size=vocab_size,
+                                              intermediate_size=intermediate_size)
+        mapped = Mapper.map_hf_state_dict_to_custom(hf_sd, n_layer, hf_cfg)
+        for key, value in mapped.items():
+            if "norm" in key or "layernorm" in key:
+                self.assertTrue(torch.equal(value, torch.ones_like(value)),
+                                f"Gemma 3 norm weight {key} should be offset by +1")
+
+    def test_partial_rotary_inv_freq_zero_padded(self):
+        """Partial RoPE zero-pads inv_freq to head_dim//2 and divides by head_dim."""
+        head_dim, rotary_dim, rope_theta = 512, 128, 1000000.0
+        attn = nnl.CausalSelfAttention(
+            num_heads=8, head_dim=head_dim, rope_theta=rope_theta,
+            rotary_dim=rotary_dim)
+        self.assertEqual(attn.inv_freq.shape[0], head_dim // 2)
+        rope_angles = rotary_dim // 2
+        self.assertTrue(torch.all(attn.inv_freq[:rope_angles] != 0))
+        self.assertTrue(torch.all(attn.inv_freq[rope_angles:] == 0))
+        expected = 1.0 / (rope_theta ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32) / head_dim))
+        self.assertTrue(torch.allclose(attn.inv_freq[:rope_angles], expected))
+
+    def test_full_rotary_inv_freq_not_padded(self):
+        """Without partial RoPE, inv_freq has head_dim//2 entries, no zero-padding."""
+        head_dim, rope_theta = 256, 10000.0
+        attn = nnl.CausalSelfAttention(
+            num_heads=8, head_dim=head_dim, rope_theta=rope_theta)
+        self.assertEqual(attn.inv_freq.shape[0], head_dim // 2)
+        self.assertTrue(torch.all(attn.inv_freq != 0))
+
     @patch("neural_net_model.NeuralNetworkModel.serialize")
-    @patch("neural_net_model.AutoModelForCausalLM")
+    @patch("neural_net_model.load_safetensors")
+    @patch("neural_net_model.snapshot_download", return_value="/tmp/model")
     @patch("neural_net_model.AutoConfig")
-    def test_from_huggingface_gemma_returns_model(self, MockConfig, MockModel, mock_serialize):
+    def test_from_huggingface_gemma_returns_model(self, MockConfig, mock_dl, mock_load, mock_serialize):
         n_layer, n_embd, n_head, n_kv_heads, head_dim = 1, 32, 4, 2, 8
         vocab_size, intermediate_size = 64, 64
         hf_cfg = self._make_gemma_hf_config(model_type="gemma3", n_layer=n_layer,
@@ -1204,12 +1583,12 @@ class TestNeuralNetModel(unittest.TestCase):
                                               vocab_size=vocab_size,
                                               intermediate_size=intermediate_size)
         MockConfig.from_pretrained.return_value = hf_cfg
-        MockModel.from_pretrained.return_value = self._make_hf_model_mock(
-            self._make_gemma_hf_sd(model_type="gemma3", n_layer=n_layer,
-                                    n_embd=n_embd, n_head=n_head,
-                                    n_kv_heads=n_kv_heads, head_dim=head_dim,
-                                    vocab_size=vocab_size,
-                                    intermediate_size=intermediate_size))
+        mock_load.return_value = self._make_gemma_hf_sd(
+            model_type="gemma3", n_layer=n_layer,
+            n_embd=n_embd, n_head=n_head,
+            n_kv_heads=n_kv_heads, head_dim=head_dim,
+            vocab_size=vocab_size,
+            intermediate_size=intermediate_size)
 
         model = NeuralNetworkModel.from_huggingface("my-gemma", "google/gemma-3-1b")
 
