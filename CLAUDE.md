@@ -1,93 +1,66 @@
 # CLAUDE.md
 
-Guidance for Claude (Anthropic's AI assistant) and other AI coding agents working in this
-repository, following the conventions of [AGENTS.md](AGENTS.md) and [warp.md](warp.md).
+Repository context for Claude Code. Facts below are derived from the code; when other
+docs disagree, the code wins. Details: [README.md](README.md) (setup),
+[warp.md](warp.md) (endpoints/workflows), [AGENTS.md](AGENTS.md) (agent rules).
 
-## Purpose
+## What this repo is
 
-This file was requested in
-[issue #87](https://github.com/derinworks/penr-oz-neural-network-v3-torch-ddp/issues/87)
-to document the Anthropic/Voyage AI (Claude) provider for this repository.
+Python 3.10 FastAPI service for creating, training, and running GPT-style neural
+networks with PyTorch, scaling training across GPUs/CPUs via Distributed Data Parallel
+(DDP). Version 3 of the penr-oz neural-network series, following Karpathy's
+nn-zero-to-hero / nanoGPT lineage. Everything runs locally — no external LLM or
+embedding providers.
 
-**Provider status: this repository does not integrate the Anthropic (Claude) or Voyage AI
-APIs.** There are no remote embedding or completion providers anywhere in the codebase:
+## Module map
 
-- **Tokenization** is performed locally by [`gpt_tokenizers.py`](gpt_tokenizers.py) using
-  `tiktoken` or HuggingFace `transformers` (`AutoTokenizer`/`AutoProcessor`).
-- **Embeddings** are ordinary `torch.nn.Embedding` layers (token and position embeddings)
-  defined per model via the `POST /model/` layer configuration and trained in-process with
-  PyTorch DDP — they are not fetched from any embedding API.
-- **Text generation** runs locally through the service's own GPT-style models
-  (`POST /generate/`), not through a hosted LLM API.
+- `main.py` — FastAPI app; all endpoints: `/model/`, `/import/`, `/dataset/`,
+  `/tokenize/`, `/output/`, `/evaluate/`, `/generate/`, `/decode/`, `/train/`,
+  `/progress/`, `/stats/`; dashboard at `/dashboard`, Swagger at `/docs`
+- `neural_net_model.py` — model implementation (`nn.Module`): training loop,
+  evaluation, token generation, persistence
+- `neural_net_layers.py` — custom layers: CausalSelfAttention, PositionEmbedding,
+  Summation, ResidualConnection, SoftmaxOnLast
+- `ddp.py` — DDP launcher and rank/world-size helpers; picks NCCL (CUDA) or Gloo (CPU)
+- `loaders.py` — downloads HuggingFace datasets, tokenizes in parallel, saves uint16
+  `.npy` shards under `data/`
+- `mappers.py` — maps JSON layer/optimizer configs to PyTorch objects; lazy
+  safetensors loading for HuggingFace imports (`/import/`, GPT-2 family)
+- `gpt_tokenizers.py` — `Tokenizer` wrapper: `tiktoken/<name>` → tiktoken, otherwise
+  HuggingFace `AutoTokenizer` (`AutoProcessor` for multimodal families like Gemma)
+- `kv_cache.py` — per-layer KV cache for generation; optional quantized mode
+- `static/`, `templates/`, `log_config.json` — dashboard assets and logging config
+- `run.sh`, `run-in-vm.sh` — venv bootstrap + launch scripts
 
-Accordingly, there are no Claude/Voyage endpoints, call patterns, or credentials to
-document. If an Anthropic or Voyage AI provider is added in the future, document its
-configuration keys and usage examples here.
-
-## Configuration
-
-The project has no `config.toml` and requires **no API keys** (no `ANTHROPIC_API_KEY`, no
-`VOYAGE_API_KEY`). Runtime configuration is limited to environment variables:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `TURBO_QUANT_KV_CACHE` | Set to `1` to enable quantized KV-cache in [`kv_cache.py`](kv_cache.py) | `0` (off) |
-| `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR` | Standard PyTorch DDP variables, set automatically by the launcher in [`ddp.py`](ddp.py) | managed |
-
-Tokenizer selection is per-request via the `encoding` field:
-
-- `tiktoken/<name>` (e.g. `tiktoken/gpt2`) → local `tiktoken` encoding
-- any other value (e.g. `gpt2`, `google/gemma-3-4b-it`) → HuggingFace `AutoTokenizer`
-  (multimodal families such as Gemma use `AutoProcessor`)
-
-## Usage
-
-Run the FastAPI service and exercise it via the REST API (see [README.md](README.md) and
-[warp.md](warp.md) for full endpoint documentation):
+## Commands
 
 ```bash
-pip install -r requirements.txt
-python main.py               # or: uvicorn main:app --log-config log_config.json
+pip install -r requirements.txt          # install (Python 3.10 venv recommended)
+python main.py                           # run service on :8000
+uvicorn main:app --log-config log_config.json   # alternative launch
+python -m pytest -v                      # run tests
+coverage run -m pytest && coverage report        # coverage; fails under 90%
 ```
 
-```bash
-# Tokenize text locally (no external provider involved)
-curl -X POST http://127.0.0.1:8000/tokenize/ \
-  -H "Content-Type: application/json" \
-  -d '{"encoding": "tiktoken/gpt2", "text": "To be or not to be"}'
+## Conventions
 
-# Embeddings are model layers, declared when creating a model
-curl -X POST http://127.0.0.1:8000/model/ \
-  -H "Content-Type: application/json" \
-  -d '{"model_id": "demo", "layers": [{"embedding": {"num_embeddings": 50304, "embedding_dim": 768}}], "optimizer": {"adamw": {"lr": 6e-4}}}'
-```
+- Pinned deps that matter: `pydantic` 1.x (use v1 API, not v2 idioms),
+  `torch >=2.0,<=2.7`, `fastapi 0.115`
+- Tests live in `test_<module>.py` beside each module; add tests with new features
+  and keep them runnable offline
+- Keep changes small and well-documented; run the test suite before pushing
+- Coverage threshold is enforced at 90% (`.coveragerc`)
 
-### Guidelines for AI agents
+## Gotchas
 
-- Follow repository coding conventions; keep changes small and well-documented.
-- Write meaningful commit messages and run the test suite before pushing.
-- Provide clear summaries with file references in final responses.
-
-## Licensing / Attribution
-
-- This project is distributed under the [MIT License](LICENSE).
-- No Anthropic (Claude) or Voyage AI services are used, so no provider attribution or
-  usage-license notes apply. If such an integration is added, include the required
-  attribution here.
-- The implementation follows Andrej Karpathy's
-  [nn-zero-to-hero](https://github.com/karpathy/nn-zero-to-hero),
-  [makemore](https://github.com/karpathy/makemore), and
-  [nanoGPT](https://github.com/karpathy/nanoGPT).
-
-## Tests
-
-```bash
-python -m pytest -v          # run all tests
-coverage run -m pytest && coverage report   # with coverage
-```
-
-There are no provider/API-key-dependent tests — the whole suite runs offline against
-local PyTorch code. Some tests require Linux (`/dev/shm` shared memory) and are skipped
-automatically on macOS/Windows; see [README.md](README.md#platform-specific-tests).
-When adding features, mirror the existing `test_<module>.py` layout and keep tests
-runnable without network credentials.
+- Some tests need `/dev/shm` (Linux shared memory) and auto-skip on macOS/Windows;
+  models are cached in `/dev/shm` and persisted to `models/`
+- `PUT /train/` is asynchronous: it spawns background DDP worker processes
+  (`RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR` are set by `ddp.py`, not by you)
+- Per-model and per-dataset locks reject concurrent operations with HTTP 409
+- Tokenizer `encoding` values have a prefix convention: `tiktoken/gpt2` uses tiktoken;
+  a bare value like `gpt2` or `google/gemma-3-4b-it` is treated as a HuggingFace repo id
+- `TURBO_QUANT_KV_CACHE=1` enables the quantized KV cache (default off); it is the
+  only app-level environment flag
+- `Tokenizer` is pickled into multiprocessing workers — keep it picklable
+  (see `__getstate__`/`__setstate__` in `gpt_tokenizers.py`)
