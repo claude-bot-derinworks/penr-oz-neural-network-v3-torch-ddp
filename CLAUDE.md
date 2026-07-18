@@ -17,11 +17,13 @@ embedding providers.
 - `main.py` — FastAPI app; all endpoints: `/model/`, `/import/`, `/dataset/`,
   `/tokenize/`, `/output/`, `/evaluate/`, `/generate/`, `/decode/`, `/train/`,
   `/progress/`, `/stats/`; dashboard at `/dashboard`, Swagger at `/docs`
-- `neural_net_model.py` — model implementation (`nn.Module`): training loop,
-  evaluation, token generation, persistence
+- `neural_net_model.py` — model implementation (`nn.Module`): training loop (inits the
+  process group with NCCL on CUDA, Gloo otherwise), evaluation, token generation,
+  persistence
 - `neural_net_layers.py` — custom layers: CausalSelfAttention, PositionEmbedding,
   Summation, ResidualConnection, SoftmaxOnLast
-- `ddp.py` — DDP launcher and rank/world-size helpers; picks NCCL (CUDA) or Gloo (CPU)
+- `ddp.py` — single-node DDP launcher, rank/world-size helpers, and
+  rendezvous/worker-logging configuration
 - `loaders.py` — downloads HuggingFace datasets, tokenizes in parallel, saves uint16
   `.npy` shards under `data/`
 - `mappers.py` — maps JSON layer/optimizer configs to PyTorch objects; lazy
